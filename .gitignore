@@ -1,0 +1,27 @@
+# Python & Blender bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# C/C++ build intermediates
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Runtime data & packaged release artifacts (upload binaries to GitHub Releases)
+dist/Data/
+dist/*.exe
+dist/*.dll
+dist/*.zip
+dist/*.mp4
+runtime_src/haruka_voice_overlay/
+runtime_src/*.bin
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.user
+*.suo
+.vs/
