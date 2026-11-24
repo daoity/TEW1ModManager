@@ -41,6 +41,7 @@ constexpr uintptr_t kXA2VoiceStartRva = 0x318AC0;
 constexpr uint32_t kNumMorphs    = 15;
 constexpr uint32_t kNumColliders = 5;
 constexpr uint32_t kNumDrivers   = 7;
+constexpr uint32_t kMaxVariants  = 16;
 
 enum MorphChannel : uint32_t {
     M_BLINK = 0,
@@ -228,6 +229,7 @@ struct HairChainAsset {
     float damping;
     float gravity;
     float radius;
+    uint8_t anchorSlot = 0; // 0 = head, 1..5 = colRemap[anchorSlot - 1] (e.g. 3 = spine_02 for chest!)
     std::vector<Vec3> restNodes;
 };
 
@@ -240,13 +242,24 @@ struct ColliderAsset {
 
 struct HairFingerprint {
     uint8_t headRemap;
+    uint8_t matchAnyBone = 0;   // v3 fallback: 1 if VB vert[0] bone != headRemap
+    uint8_t vert0Remap = 0;     // v3.1: exact expected raw[28] bone remap
+    uint8_t useVert0Remap = 0;  // v3.1: 1 when vert0Remap (+ vertLastRemap) is populated
+    uint8_t vertLastRemap = 0;  // v3.2: exact expected raw[(vc-1)*32 + 28] bone remap
     uint32_t vertCount;
+    uint32_t weightOffset = 0;  // v3: offset into RuntimePack::hairWeights
     float first3Pos[9];
 };
 
 struct ExtraCharFingerprint {
     uint32_t vertCount;
     float first3Pos[9];
+};
+
+struct VariantGroup {
+    wchar_t label[48] = {};
+    bool hidden = false;
+    std::vector<ExtraCharFingerprint> fps;
 };
 
 struct HairSkinVert {
@@ -269,6 +282,7 @@ struct FaceAsset {
 
 struct RuntimePack {
     bool loaded = false;
+    uint32_t version = 1;
     std::vector<SkeletonProfile> skeletons;
     std::vector<HairChainAsset> chains;
     std::vector<ColliderAsset> colliders;
@@ -276,6 +290,7 @@ struct RuntimePack {
     std::vector<HairSkinVert> hairWeights;
     std::vector<FaceAsset> faces;
     std::vector<ExtraCharFingerprint> extraCharFps;
+    std::vector<VariantGroup> variants;
     uint32_t totalHairBones = 0;
 
     const SkeletonProfile* FindSkeleton(uint8_t headRemap) const {
@@ -318,6 +333,7 @@ struct CharacterState {
 
     std::vector<ChainSimState> chainStates;
     std::vector<BoneTransformBind> boneXforms;
+    bool boneXformsValid = false;
 
     float morphWeights[kNumMorphs] = {};
     float blinkTimer = 1.8f;
@@ -336,6 +352,7 @@ struct TrackedSurfaceVB {
     bool isHair = false;
     uint8_t headRemap = 0;
     uint32_t vertCount = 0;
+    uint32_t weightOffset = 0;
     const FaceAsset* faceAsset = nullptr;
     std::vector<uint8_t> neutralVerts;
     std::vector<uint8_t> workVerts;
@@ -375,6 +392,8 @@ thread_local bool t_inInternalDraw   = false;
 struct CtxBoundState {
     ID3D11DeviceContext* ctx = nullptr;
     ID3D11Buffer* boundVB0 = nullptr;
+    UINT boundVB0Stride = 32;
+    UINT boundVB0Offset = 0;
     ID3D11Buffer* boundVSCB[4] = {};
     ID3D11PixelShader* boundPS = nullptr;
     ID3D11Buffer* boundPSCB0 = nullptr;
@@ -382,7 +401,7 @@ struct CtxBoundState {
     ID3D11ShaderResourceView* boundPSSRV[16] = {};
 };
 
-constexpr int kMaxCtxSlots = 128;
+constexpr int kMaxCtxSlots = 512;
 CtxBoundState g_ctxSlots[kMaxCtxSlots];
 std::atomic<int> g_ctxSlotCount{0};
 std::mutex g_ctxSlotMtx;
@@ -406,15 +425,234 @@ inline CtxBoundState& GetCtxState(ID3D11DeviceContext* ctx) {
     return g_ctxSlots[kMaxCtxSlots - 1];
 }
 
-// Self-illumination GPU resources & telemetry
+// Self-illumination & Sheer-Cloth GPU resources & telemetry
 ID3D11PixelShader* g_emissivePS = nullptr;
 ID3D11Buffer*      g_emissiveCB = nullptr;
+ID3D11PixelShader* g_sheerPS = nullptr;
+ID3D11Buffer*      g_sheerCB = nullptr;
+ID3D11BlendState*  g_sheerBlend = nullptr;
+ID3D11BlendState*  g_opaqueBlend = nullptr;
+std::unordered_map<uint64_t, ID3D11DepthStencilState*> g_sheerDSSCache;
+std::unordered_map<uint64_t, ID3D11RasterizerState*>   g_sheerRSCache;
+std::unordered_set<ID3D11Buffer*> g_loggedSheerVBs;
+std::unordered_map<ID3D11Buffer*, uint64_t> g_pinnedVBs; // AddRef'd VBs so chapter unload NEVER causes UAF in nvwgf2umx.dll!
+std::atomic<bool>  g_depthDirKnown{false};
+std::atomic<bool>  g_depthIsReverseZ{false};
+std::atomic<int>   g_sheerClothMode{2};      // 0=不透明, 1=高透薄纱(22-45%), 2=中透轻纱(默认42-62%), 3=微透奶纱(62-78%)
 std::atomic<uint64_t> g_frameCount{0};
 std::atomic<uint64_t> g_drawIndexedCalls{0};
 std::atomic<uint64_t> g_drawInstCalls{0};
 std::atomic<uint64_t> g_charVBDraws{0};
 std::atomic<uint64_t> g_emissiveDrawCount{0};
+std::atomic<uint64_t> g_sheerDrawCount{0};
 std::atomic<bool>     g_loggedCharDrawDiag{false};
+
+// In-game Insert Variant Overlay state & D3D11 resources
+struct VariantVBState {
+    int groupIdx = -1;
+    bool isSheerCloth = false;
+    bool seenThisFrame = false;
+    bool origHasNaN = false;
+    ID3D11Buffer* sheerVB = nullptr;
+    std::vector<uint8_t> neutralVerts;
+    std::vector<uint8_t> hiddenVerts;
+};
+std::atomic<bool> g_overlayOpen{false};
+std::atomic<bool> g_overlayDirty{true};
+std::atomic<int>  g_overlayCursor{0};
+std::atomic<UINT> g_panelToggleVK{VK_OEM_3}; // Default: ` (~ key below Esc, 0xC0); customizable in-panel or tew1_dyn_hotkey.ini!
+std::atomic<bool> g_rebindingKey{false};
+std::atomic<bool> g_rebindWaitRelease{false};
+wchar_t           g_dllDir[MAX_PATH] = {};
+std::atomic<bool> g_variantHidden[kMaxVariants] = {};
+std::unordered_map<ID3D11Buffer*, int> g_vbVariantGroup;
+std::unordered_map<ID3D11Buffer*, VariantVBState> g_variantVBs;
+
+inline bool IsSheerVariantLabel(const wchar_t* label) {
+    if (!label || !*label) return false;
+    return (wcsstr(label, L"睡衣") != nullptr) || (wcsstr(label, L"透明") != nullptr) || (wcsstr(label, L"Sheer") != nullptr);
+}
+
+inline bool HasAnySheerVariant() {
+    for (const auto& vg : g_pack.variants) {
+        if (IsSheerVariantLabel(vg.label)) return true;
+    }
+    return false;
+}
+
+void GetVkLabelW(UINT vk, wchar_t* out, size_t cap) {
+    if (vk == VK_OEM_3) { swprintf_s(out, cap, L"`"); return; }
+    if (vk == VK_INSERT) { swprintf_s(out, cap, L"Insert"); return; }
+    if (vk == VK_HOME) { swprintf_s(out, cap, L"Home"); return; }
+    if (vk == VK_END) { swprintf_s(out, cap, L"End"); return; }
+    if (vk == VK_DELETE) { swprintf_s(out, cap, L"Del"); return; }
+    if (vk == VK_PRIOR) { swprintf_s(out, cap, L"PgUp"); return; }
+    if (vk == VK_NEXT) { swprintf_s(out, cap, L"PgDn"); return; }
+    if (vk == VK_TAB) { swprintf_s(out, cap, L"Tab"); return; }
+    if (vk == VK_CAPITAL) { swprintf_s(out, cap, L"Caps"); return; }
+    if (vk == VK_OEM_MINUS) { swprintf_s(out, cap, L"-"); return; }
+    if (vk == VK_OEM_PLUS) { swprintf_s(out, cap, L"="); return; }
+    if (vk == VK_OEM_4) { swprintf_s(out, cap, L"["); return; }
+    if (vk == VK_OEM_6) { swprintf_s(out, cap, L"]"); return; }
+    if (vk == VK_OEM_5) { swprintf_s(out, cap, L"\\"); return; }
+    if (vk >= VK_F1 && vk <= VK_F12) { swprintf_s(out, cap, L"F%u", vk - VK_F1 + 1); return; }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) { swprintf_s(out, cap, L"%c", (wchar_t)vk); return; }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) { swprintf_s(out, cap, L"Num%u", vk - VK_NUMPAD0); return; }
+    swprintf_s(out, cap, L"0x%02X", vk & 0xFF);
+}
+
+void GetVkConfigNameA(UINT vk, char* out, size_t cap) {
+    if (vk == VK_OEM_3) { snprintf(out, cap, "`"); return; }
+    if (vk == VK_INSERT) { snprintf(out, cap, "INSERT"); return; }
+    if (vk == VK_HOME) { snprintf(out, cap, "HOME"); return; }
+    if (vk == VK_END) { snprintf(out, cap, "END"); return; }
+    if (vk == VK_DELETE) { snprintf(out, cap, "DEL"); return; }
+    if (vk == VK_PRIOR) { snprintf(out, cap, "PGUP"); return; }
+    if (vk == VK_NEXT) { snprintf(out, cap, "PGDN"); return; }
+    if (vk == VK_TAB) { snprintf(out, cap, "TAB"); return; }
+    if (vk == VK_CAPITAL) { snprintf(out, cap, "CAPS"); return; }
+    if (vk == VK_OEM_MINUS) { snprintf(out, cap, "-"); return; }
+    if (vk == VK_OEM_PLUS) { snprintf(out, cap, "="); return; }
+    if (vk == VK_OEM_4) { snprintf(out, cap, "["); return; }
+    if (vk == VK_OEM_6) { snprintf(out, cap, "]"); return; }
+    if (vk >= VK_F1 && vk <= VK_F12) { snprintf(out, cap, "F%u", vk - VK_F1 + 1); return; }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) { snprintf(out, cap, "%c", (char)vk); return; }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) { snprintf(out, cap, "NUM%u", vk - VK_NUMPAD0); return; }
+    snprintf(out, cap, "0x%02X", vk & 0xFF);
+}
+
+UINT ParseVkFromStrA(const char* raw) {
+    if (!raw) return VK_OEM_3;
+    while (*raw == ' ' || *raw == '\t') raw++;
+    char buf[64] = {};
+    size_t n = 0;
+    while (raw[n] && raw[n] != '\r' && raw[n] != '\n' && raw[n] != '#' && raw[n] != ';' && n + 1 < sizeof(buf)) {
+        buf[n] = (char)std::toupper((unsigned char)raw[n]);
+        n++;
+    }
+    while (n > 0 && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = '\0';
+    if (n == 0) return VK_OEM_3;
+    if (strcmp(buf, "`") == 0 || strcmp(buf, "~") == 0 || strcmp(buf, "OEM_3") == 0 || strcmp(buf, "GRAVE") == 0) return VK_OEM_3;
+    if (strcmp(buf, "INSERT") == 0 || strcmp(buf, "INS") == 0) return VK_INSERT;
+    if (strcmp(buf, "HOME") == 0) return VK_HOME;
+    if (strcmp(buf, "END") == 0) return VK_END;
+    if (strcmp(buf, "DEL") == 0 || strcmp(buf, "DELETE") == 0) return VK_DELETE;
+    if (strcmp(buf, "PGUP") == 0 || strcmp(buf, "PAGEUP") == 0) return VK_PRIOR;
+    if (strcmp(buf, "PGDN") == 0 || strcmp(buf, "PAGEDOWN") == 0) return VK_NEXT;
+    if (strcmp(buf, "TAB") == 0) return VK_TAB;
+    if (strcmp(buf, "CAPS") == 0 || strcmp(buf, "CAPSLOCK") == 0) return VK_CAPITAL;
+    if (strcmp(buf, "-") == 0) return VK_OEM_MINUS;
+    if (strcmp(buf, "=") == 0) return VK_OEM_PLUS;
+    if (strcmp(buf, "[") == 0) return VK_OEM_4;
+    if (strcmp(buf, "]") == 0) return VK_OEM_6;
+    if (buf[0] == 'F' && n >= 2 && n <= 3) {
+        int fn = atoi(buf + 1);
+        if (fn >= 1 && fn <= 12) return (UINT)(VK_F1 + fn - 1);
+    }
+    if (strncmp(buf, "NUM", 3) == 0 && n == 4 && buf[3] >= '0' && buf[3] <= '9') {
+        return (UINT)(VK_NUMPAD0 + (buf[3] - '0'));
+    }
+    if (n == 1 && ((buf[0] >= 'A' && buf[0] <= 'Z') || (buf[0] >= '0' && buf[0] <= '9'))) {
+        return (UINT)(unsigned char)buf[0];
+    }
+    if (n >= 3 && buf[0] == '0' && buf[1] == 'X') {
+        unsigned v = (unsigned)strtoul(buf + 2, nullptr, 16);
+        if (v >= 0x08 && v <= 0xFE) return v;
+    }
+    unsigned dec = (unsigned)strtoul(buf, nullptr, 10);
+    if (dec >= 0x08 && dec <= 0xFE) return dec;
+    return VK_OEM_3;
+}
+
+void SavePanelHotkeyConfig(UINT vk) {
+    if (!g_dllDir[0]) return;
+    wchar_t iniPath[MAX_PATH] = {};
+    swprintf_s(iniPath, L"%stew1_dyn_hotkey.ini", g_dllDir);
+    char keyName[32] = {};
+    GetVkConfigNameA(vk, keyName, sizeof(keyName));
+    char content[512] = {};
+    snprintf(content, sizeof(content),
+             "# TEW1 服装差分面板自定义快捷键配置\r\n"
+             "# 可在游戏内按当前快捷键打开面板 -> 点第 [9] 项直接改键，或手动修改下方 toggle_key：\r\n"
+             "# 支持示例: ` (默认波浪键), HOME, END, PGUP, PGDN, F1-F6, F11, F12, TAB, [, ], A-Z, 或十六进制虚拟键码如 0xC0\r\n"
+             "toggle_key=%s\r\n",
+             keyName);
+    HANDLE f = CreateFileW(iniPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(f, content, (DWORD)std::strlen(content), &wr, nullptr);
+        CloseHandle(f);
+    }
+}
+
+bool ContainsAsciiCI(const char* haystack, const char* needle);
+
+void LoadPanelHotkeyConfig() {
+    UINT vk = VK_OEM_3; // Default: ` (~ key)
+    wchar_t envBuf[64] = {};
+    if (GetEnvironmentVariableW(L"TEW1_DYN_PANEL_KEY", envBuf, 64) > 0) {
+        char aBuf[64] = {};
+        WideCharToMultiByte(CP_ACP, 0, envBuf, -1, aBuf, sizeof(aBuf), nullptr, nullptr);
+        vk = ParseVkFromStrA(aBuf);
+        g_panelToggleVK.store(vk);
+        return;
+    }
+    if (!g_dllDir[0]) {
+        g_panelToggleVK.store(vk);
+        return;
+    }
+    wchar_t iniPath[MAX_PATH] = {};
+    swprintf_s(iniPath, L"%stew1_dyn_hotkey.ini", g_dllDir);
+    HANDLE f = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        g_panelToggleVK.store(vk);
+        SavePanelHotkeyConfig(vk);
+        return;
+    }
+    char data[2048] = {};
+    DWORD rd = 0;
+    if (ReadFile(f, data, sizeof(data) - 1, &rd, nullptr) && rd > 0) {
+        data[rd] = '\0';
+        const char* p = data;
+        while (*p) {
+            const char* eol = strchr(p, '\n');
+            size_t len = eol ? (size_t)(eol - p) : std::strlen(p);
+            char line[256] = {};
+            if (len < sizeof(line)) {
+                memcpy(line, p, len);
+                line[len] = '\0';
+                const char* eq = strchr(line, '=');
+                if (eq && line[0] != '#' && line[0] != ';') {
+                    if (ContainsAsciiCI(line, "toggle_key")) {
+                        vk = ParseVkFromStrA(eq + 1);
+                        break;
+                    }
+                }
+            }
+            if (!eol) break;
+            p = eol + 1;
+        }
+    }
+    CloseHandle(f);
+    g_panelToggleVK.store(vk);
+}
+
+ID3D11VertexShader*       g_uiVS = nullptr;
+ID3D11PixelShader*        g_uiPS = nullptr;
+ID3D11BlendState*         g_uiBlend = nullptr;
+ID3D11SamplerState*       g_uiSampler = nullptr;
+ID3D11RasterizerState*    g_uiRS = nullptr;
+ID3D11DepthStencilState*  g_uiDSS = nullptr;
+ID3D11Texture2D*          g_uiTex = nullptr;
+ID3D11ShaderResourceView* g_uiSRV = nullptr;
+int                       g_uiTexW = 0;
+int                       g_uiTexH = 0;
+constexpr int             kOverlayX = 36;
+constexpr int             kOverlayY = 36;
+constexpr int             kOverlayW = 460;
+constexpr int             kOverlayHeaderH = 62;
+constexpr int             kOverlayRowH = 36;
+constexpr int             kOverlayFooterH = 42;
 
 void LogFmt(const char* fmt, ...) {
     if (g_log == INVALID_HANDLE_VALUE) return;
@@ -496,12 +734,13 @@ bool LoadRuntimePack(const wchar_t* path) {
     char magic[4];
     uint32_t version, nSkel, nChains, nCols, nHairFps, nFaces, nMorphs;
     if (!r.ReadBytes(magic, 4) || memcmp(magic, "TEWH", 4) != 0) return false;
-    if (!r.Read(version) || (version != 1 && version != 2)) return false;
+    if (!r.Read(version) || (version < 1 || version > 3)) return false;
     if (!r.Read(nSkel) || !r.Read(nChains) || !r.Read(nCols) || !r.Read(nHairFps) || !r.Read(nFaces) || !r.Read(nMorphs))
         return false;
-    if (nMorphs != kNumMorphs || nCols > 16 || nChains > 32) return false;
+    if (nMorphs != kNumMorphs || nCols > 16 || nChains > 48) return false;
 
     RuntimePack pack;
+    pack.version = version;
     pack.skeletons.resize(nSkel);
     for (uint32_t i = 0; i < nSkel; i++) {
         auto& sk = pack.skeletons[i];
@@ -539,10 +778,13 @@ bool LoadRuntimePack(const wchar_t* path) {
         uint8_t pad3[3];
         if (!r.Read(fp.headRemap) || !r.ReadBytes(pad3, 3) || !r.Read(fp.vertCount) || !r.ReadBytes(fp.first3Pos, 36))
             return false;
+        fp.vert0Remap = pad3[0];
+        fp.useVert0Remap = (pad3[1] == 1 || pad3[1] == 2) ? pad3[1] : 0;
+        fp.vertLastRemap = pad3[2];
     }
 
     uint32_t nHairVerts = 0;
-    if (!r.Read(nHairVerts) || nHairVerts > 65536) return false;
+    if (!r.Read(nHairVerts) || nHairVerts > 262144) return false;
     pack.hairWeights.resize(nHairVerts);
     if (nHairVerts > 0 && !r.ReadBytes(pack.hairWeights.data(), nHairVerts * sizeof(HairSkinVert))) return false;
 
@@ -577,11 +819,58 @@ bool LoadRuntimePack(const wchar_t* path) {
         }
     }
 
+    if (version >= 3 && r.ptr + nChains + nHairFps * 5 <= r.end) {
+        // Section 7 (v3): Per-chain anchorSlot + Per-hairFP matchAnyBone & weightOffset
+        for (uint32_t i = 0; i < nChains; i++) {
+            uint8_t slot = 0;
+            if (!r.Read(slot)) break;
+            pack.chains[i].anchorSlot = slot;
+        }
+        for (uint32_t i = 0; i < nHairFps; i++) {
+            uint8_t anyB = 0;
+            uint32_t wOff = 0;
+            if (!r.Read(anyB) || !r.Read(wOff)) break;
+            pack.hairFps[i].matchAnyBone = anyB;
+            pack.hairFps[i].weightOffset = wOff;
+        }
+        // Section 8 (v3): Clothing Variant Groups for Insert in-game panel
+        if (r.ptr + 4 <= r.end) {
+            uint32_t nVar = 0;
+            if (r.Read(nVar) && nVar <= kMaxVariants) {
+                pack.variants.resize(nVar);
+                for (uint32_t vi = 0; vi < nVar; vi++) {
+                    char utf8[48] = {};
+                    uint8_t defHid = 0, p3[3] = {};
+                    uint32_t nFps = 0;
+                    if (!r.ReadBytes(utf8, 48) || !r.Read(defHid) || !r.ReadBytes(p3, 3) || !r.Read(nFps) || nFps > 256) {
+                        pack.variants.clear();
+                        break;
+                    }
+                    utf8[47] = '\0';
+                    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, pack.variants[vi].label, 48);
+                    pack.variants[vi].hidden = (defHid != 0);
+                    pack.variants[vi].fps.resize(nFps);
+                    for (uint32_t k = 0; k < nFps; k++) {
+                        if (!r.Read(pack.variants[vi].fps[k].vertCount) || !r.ReadBytes(pack.variants[vi].fps[k].first3Pos, 36)) {
+                            pack.variants.clear();
+                            break;
+                        }
+                    }
+                    if (pack.variants.empty()) break;
+                }
+            }
+        }
+    }
+
     pack.loaded = true;
     g_pack = std::move(pack);
-    LogFmt("Loaded tew1_dyn pack v%u: skels=%u chains=%u bones=%u cols=%u hairFps=%u faceSurfs=%u extraCharVBs=%u\n",
+    for (size_t vi = 0; vi < kMaxVariants; vi++) {
+        g_variantHidden[vi].store(vi < g_pack.variants.size() ? g_pack.variants[vi].hidden : false);
+    }
+    g_overlayDirty.store(true);
+    LogFmt("Loaded tew1_dyn pack v%u: skels=%u chains=%u bones=%u cols=%u hairFps=%u faceSurfs=%u extraCharVBs=%u variants=%zu\n",
            version, nSkel, nChains, g_pack.totalHairBones, nCols, nHairFps, nFaces,
-           (uint32_t)g_pack.extraCharFps.size());
+           (uint32_t)g_pack.extraCharFps.size(), g_pack.variants.size());
     return true;
 }
 
@@ -669,11 +958,21 @@ void StepHairPhysics(CharacterState& st, const SkeletonProfile& skel, const Mat3
         auto& cs = st.chainStates[ci];
         const size_t nNodes = ch.restNodes.size();
 
+        Mat34 anchorWorld = headWorld;
+        Mat34 anchorWorldInv = headWorldInv;
+        if (ch.anchorSlot >= 1 && ch.anchorSlot <= kNumColliders) {
+            Mat34 aSkin{};
+            if (readBoneSkin(skel.colRemap[ch.anchorSlot - 1], aSkin)) {
+                anchorWorld = MulMat(modelMat, aSkin);
+                anchorWorldInv = InvertRigid(anchorWorld);
+            }
+        }
+
         std::vector<Vec3> restBind(nNodes);
         std::vector<Vec3> targetW(nNodes);
         for (size_t i = 0; i < nNodes; i++) {
             restBind[i] = MulPoint(skel.headAlign, ch.restNodes[i]);
-            targetW[i] = MulPoint(headWorld, restBind[i]);
+            targetW[i] = MulPoint(anchorWorld, restBind[i]);
         }
 
         if (!cs.initialized || teleported || cs.pos.size() != nNodes) {
@@ -719,21 +1018,35 @@ void StepHairPhysics(CharacterState& st, const SkeletonProfile& skel, const Mat3
                         cs.pos[i + 1] -= off;
                     }
                 }
-                for (uint32_t k = 0; k < capCount; k++) {
-                    const float limit = capsules[k].radius + ch.radius;
-                    for (size_t i = 1; i < nNodes; i++) {
-                        cs.pos[i] += PushOutCapsule(cs.pos[i], capsules[k], limit, stepAnchor[i]);
+                if (ch.anchorSlot == 0) {
+                    // Hair chains collide against the 5 humanoid body/head capsules
+                    for (uint32_t k = 0; k < capCount; k++) {
+                        const float limit = capsules[k].radius + ch.radius;
+                        for (size_t i = 1; i < nNodes; i++) {
+                            cs.pos[i] += PushOutCapsule(cs.pos[i], capsules[k], limit, stepAnchor[i]);
+                        }
+                        for (size_t i = 1; i < nNodes; i++) {
+                            const float ts[2] = {0.33f, 0.67f};
+                            for (float t : ts) {
+                                Vec3 mid = Lerp(cs.pos[i - 1], cs.pos[i], t);
+                                Vec3 corr = PushOutCapsule(mid, capsules[k], limit, stepAnchor[i]);
+                                if (LenSq(corr) < 1e-10f) continue;
+                                float a = (i > 1) ? (1.f - t) : 0.f;
+                                float denom = a * a + t * t;
+                                if (a > 0.f) cs.pos[i - 1] += corr * (a / denom);
+                                cs.pos[i] += corr * (t / denom);
+                            }
+                        }
                     }
+                } else {
+                    // Chest / soft-body chains: NEVER push out of torso capsule!
+                    // Clamp displacement smoothly around rest target within ch.radius so bounce stays natural & never explodes.
+                    const float maxDisp = std::max(0.15f, ch.radius);
                     for (size_t i = 1; i < nNodes; i++) {
-                        const float ts[2] = {0.33f, 0.67f};
-                        for (float t : ts) {
-                            Vec3 mid = Lerp(cs.pos[i - 1], cs.pos[i], t);
-                            Vec3 corr = PushOutCapsule(mid, capsules[k], limit, stepAnchor[i]);
-                            if (LenSq(corr) < 1e-10f) continue;
-                            float a = (i > 1) ? (1.f - t) : 0.f;
-                            float denom = a * a + t * t;
-                            if (a > 0.f) cs.pos[i - 1] += corr * (a / denom);
-                            cs.pos[i] += corr * (t / denom);
+                        Vec3 disp = cs.pos[i] - stepAnchor[i];
+                        float dl = Len(disp);
+                        if (dl > maxDisp) {
+                            cs.pos[i] = stepAnchor[i] + disp * (maxDisp / dl);
                         }
                     }
                 }
@@ -744,7 +1057,7 @@ void StepHairPhysics(CharacterState& st, const SkeletonProfile& skel, const Mat3
 
         std::vector<Vec3> solvedBind(nNodes);
         for (size_t i = 0; i < nNodes; i++) {
-            solvedBind[i] = MulPoint(headWorldInv, cs.pos[i]);
+            solvedBind[i] = MulPoint(anchorWorldInv, cs.pos[i]);
         }
 
         for (uint32_t bi = 0; bi < ch.numBones; bi++) {
@@ -756,6 +1069,7 @@ void StepHairPhysics(CharacterState& st, const SkeletonProfile& skel, const Mat3
             RotationBetween(rDir, sDir, bx.rot);
         }
     }
+    st.boneXformsValid = (boneCursor == g_pack.totalHairBones);
 }
 
 // ============================================================================
@@ -779,13 +1093,17 @@ void ToggleEmissiveMode(int mode, const char* keyName, const char* modeName) {
            (unsigned long long)g_emissiveDrawCount.load());
 }
 
-void PollHotkeys() {
+void PollHotkeys(IDXGISwapChain* sc) {
     static bool prevF7 = false, prevF8 = false, prevF9 = false, prevF10 = false;
+    static bool prevIns = false, prevUp = false, prevDown = false, prevRet = false, prevLMB = false;
+    static bool prevNum[10] = {};
 
-    bool f7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
-    bool f8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
-    bool f9  = (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
-    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    bool f7  = (GetAsyncKeyState(VK_F7)     & 0x8000) != 0;
+    bool f8  = (GetAsyncKeyState(VK_F8)     & 0x8000) != 0;
+    bool f9  = (GetAsyncKeyState(VK_F9)     & 0x8000) != 0;
+    bool f10 = (GetAsyncKeyState(VK_F10)    & 0x8000) != 0;
+    UINT toggleVk = g_panelToggleVK.load();
+    bool tog = (GetAsyncKeyState((int)toggleVk) & 0x8000) != 0;
 
     if (f7 && !prevF7) {
         ToggleEmissiveMode(1, "F7", "SoftEmissive");
@@ -815,7 +1133,152 @@ void PollHotkeys() {
         }
     }
 
-    prevF7 = f7; prevF8 = f8; prevF9 = f9; prevF10 = f10;
+    // Live in-game hotkey rebinding mode (triggered by row [9] inside the panel!)
+    if (g_rebindingKey.load()) {
+        bool anyHeld = false;
+        UINT pressedVk = 0;
+        for (UINT vk = 0x08; vk <= 0xFE; vk++) {
+            // Skip mouse buttons, Shift/Ctrl/Alt modifiers alone
+            if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+                vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                vk == VK_LMENU || vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN) {
+                continue;
+            }
+            if ((GetAsyncKeyState((int)vk) & 0x8000) != 0) {
+                anyHeld = true;
+                if (pressedVk == 0) pressedVk = vk;
+            }
+        }
+        bool lmbNow = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (g_rebindWaitRelease.load()) {
+            if (!anyHeld && !lmbNow) {
+                g_rebindWaitRelease.store(false);
+            }
+        } else if (pressedVk != 0) {
+            if (pressedVk == VK_ESCAPE) {
+                g_rebindingKey.store(false);
+                g_overlayDirty.store(true);
+                LogFmt("Panel Hotkey Rebind: cancelled by ESC\n");
+            } else {
+                g_panelToggleVK.store(pressedVk);
+                SavePanelHotkeyConfig(pressedVk);
+                g_rebindingKey.store(false);
+                g_overlayDirty.store(true);
+                char kn[32] = {};
+                GetVkConfigNameA(pressedVk, kn, sizeof(kn));
+                LogFmt("Panel Hotkey Rebound -> %s (VK=0x%02X), saved to tew1_dyn_hotkey.ini\n", kn, pressedVk);
+            }
+            prevIns = true; // Debounce newly bound key so it doesn't immediately close the panel
+        }
+        prevF7 = f7; prevF8 = f8; prevF9 = f9; prevF10 = f10;
+        prevUp = prevDown = prevRet = prevLMB = true;
+        for (int k = 0; k <= 9; k++) prevNum[k] = true;
+        return;
+    }
+
+    if (tog && !prevIns) {
+        bool next = !g_overlayOpen.load();
+        g_overlayOpen.store(next);
+        g_overlayDirty.store(true);
+        char kn[32] = {};
+        GetVkConfigNameA(toggleVk, kn, sizeof(kn));
+        LogFmt("Hotkey [%s]: Variant Panel = %s (variants=%zu)\n", kn, next ? "OPEN" : "CLOSED", g_pack.variants.size());
+        prevF7 = f7; prevF8 = f8; prevF9 = f9; prevF10 = f10; prevIns = tog;
+        return;
+    }
+
+    if (g_overlayOpen.load() && !g_pack.variants.empty()) {
+        const int nVar = static_cast<int>(g_pack.variants.size());
+        const bool hasSheerRow = HasAnySheerVariant();
+        const int sheerRowIdx = hasSheerRow ? nVar : -1;
+        const int hotkeyRowIdx = nVar + (hasSheerRow ? 1 : 0);
+        const int totalRows = hotkeyRowIdx + 1;
+        bool up   = (GetAsyncKeyState(VK_UP)     & 0x8000) != 0;
+        bool down = (GetAsyncKeyState(VK_DOWN)   & 0x8000) != 0;
+        bool ret  = ((GetAsyncKeyState(VK_RETURN) & 0x8000) != 0) || ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0);
+        bool lmb  = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+        auto toggleRow = [&](int idx) {
+            if (idx >= 0 && idx < nVar) {
+                g_variantHidden[idx].store(!g_variantHidden[idx].load());
+                g_overlayDirty.store(true);
+            } else if (hasSheerRow && idx == sheerRowIdx) {
+                int nextSheer = (g_sheerClothMode.load() + 1) % 4;
+                g_sheerClothMode.store(nextSheer);
+                g_emissiveDirty.store(true);
+                g_overlayDirty.store(true);
+                static const char* kModeNames[4] = {"0=SolidOpaque(100%)", "1=HighSheer(22-45%)", "2=MidSheer(42-62%)", "3=SoftSheer(62-78%)"};
+                LogFmt("Panel: Outerwear Sheer Mode = %s\n", kModeNames[nextSheer]);
+            } else if (idx == hotkeyRowIdx) {
+                g_rebindingKey.store(true);
+                g_rebindWaitRelease.store(true);
+                g_overlayDirty.store(true);
+                LogFmt("Panel: Waiting for new custom toggle hotkey (press ESC to cancel)...\n");
+            }
+        };
+
+        if (up && !prevUp) {
+            int c = (g_overlayCursor.load() - 1 + totalRows) % totalRows;
+            g_overlayCursor.store(c);
+            g_overlayDirty.store(true);
+        }
+        if (down && !prevDown) {
+            int c = (g_overlayCursor.load() + 1) % totalRows;
+            g_overlayCursor.store(c);
+            g_overlayDirty.store(true);
+        }
+        if (ret && !prevRet) {
+            toggleRow(g_overlayCursor.load());
+        }
+        for (int k = 0; k <= 9; k++) {
+            bool pressed = ((GetAsyncKeyState('0' + k) & 0x8000) != 0) ||
+                           ((GetAsyncKeyState(VK_NUMPAD0 + k) & 0x8000) != 0);
+            if (pressed && !prevNum[k]) {
+                if (k == 0) {
+                    bool anyVisible = false;
+                    for (int vi = 0; vi < nVar; vi++) {
+                        if (!g_variantHidden[vi].load()) { anyVisible = true; break; }
+                    }
+                    for (int vi = 0; vi < nVar; vi++) g_variantHidden[vi].store(anyVisible);
+                    g_overlayDirty.store(true);
+                } else if (k - 1 < totalRows) {
+                    int idx = k - 1;
+                    g_overlayCursor.store(idx);
+                    toggleRow(idx);
+                }
+            }
+            prevNum[k] = pressed;
+        }
+        if (lmb && !prevLMB && sc) {
+            DXGI_SWAP_CHAIN_DESC sd{};
+            if (SUCCEEDED(sc->GetDesc(&sd)) && sd.OutputWindow) {
+                POINT pt{};
+                if (GetCursorPos(&pt) && ScreenToClient(sd.OutputWindow, &pt)) {
+                    if (pt.x >= kOverlayX && pt.x <= kOverlayX + kOverlayW) {
+                        int relY = pt.y - (kOverlayY + kOverlayHeaderH);
+                        if (relY >= 0 && relY < totalRows * kOverlayRowH) {
+                            int idx = relY / kOverlayRowH;
+                            g_overlayCursor.store(idx);
+                            toggleRow(idx);
+                        } else if (relY >= totalRows * kOverlayRowH && relY < totalRows * kOverlayRowH + kOverlayFooterH) {
+                            bool anyVisible = false;
+                            for (int vi = 0; vi < nVar; vi++) {
+                                if (!g_variantHidden[vi].load()) { anyVisible = true; break; }
+                            }
+                            for (int vi = 0; vi < nVar; vi++) g_variantHidden[vi].store(anyVisible);
+                            g_overlayDirty.store(true);
+                        }
+                    }
+                }
+            }
+        }
+        prevUp = up; prevDown = down; prevRet = ret; prevLMB = lmb;
+    } else {
+        prevUp = prevDown = prevRet = prevLMB = false;
+        for (int k = 0; k <= 9; k++) prevNum[k] = false;
+    }
+
+    prevF7 = f7; prevF8 = f8; prevF9 = f9; prevF10 = f10; prevIns = tog;
 }
 
 void StepFacialMorphs(CharacterState& st, float dt, bool teleported) {
@@ -938,12 +1401,14 @@ void StepFacialMorphs(CharacterState& st, float dt, bool teleported) {
 void DeformHairVertices(TrackedSurfaceVB& tvb, const CharacterState& st) {
     const uint32_t vc = tvb.vertCount;
     memcpy(tvb.workVerts.data(), tvb.neutralVerts.data(), (size_t)vc * 32);
-    if (!g_enableHair.load() || st.boneXforms.size() < g_pack.totalHairBones || g_pack.hairWeights.size() != vc)
+    if (!g_enableHair.load() || !st.boneXformsValid || st.boneXforms.size() < g_pack.totalHairBones)
+        return;
+    if ((size_t)tvb.weightOffset + vc > g_pack.hairWeights.size())
         return;
 
     const uint8_t* src = tvb.neutralVerts.data();
     uint8_t* dst = tvb.workVerts.data();
-    const auto& weights = g_pack.hairWeights;
+    const HairSkinVert* weights = g_pack.hairWeights.data() + tvb.weightOffset;
     const auto& xforms = st.boneXforms;
 
     for (uint32_t i = 0; i < vc; i++) {
@@ -1102,11 +1567,91 @@ float4 main(PS_IN input) : SV_Target {
 }
 )HLSL";
 
+// True Blender-style Semi-Transparent / Solid-Opaque Cloth Pixel Shader
+// Supports 4 levels in Insert panel: 0=SolidOpaque (100% solid, ignores BC3 alpha), 1=SoftSheer, 2=MidSheer, 3=OriginalBlenderSheer
+static const char* kSheerPSHlsl = R"HLSL(
+cbuffer constantBufferP : register(b0) {
+    float4 renderpositiontoviewtexture;
+};
+cbuffer SheerParams : register(b4) {
+    float4 u_sheer; // x=emissiveFloor, y=sceneWeight, z=hemiMin, w=rolloff
+    float4 u_alpha; // x=alphaScale, y=alphaBias, z=forceOpaque(0 or 1), w=fresnelBoost
+};
+Texture2D texBump : register(t0);
+SamplerState sampBump : register(s0);
+Texture2D texAlbedo : register(t1);
+SamplerState sampAlbedo : register(s1);
+Texture2D texLightBuf : register(t10);
+SamplerState sampLightBuf : register(s7);
+
+struct PS_IN {
+    float4 texcoord0  : TEXCOORD0;
+    float4 htexcoord1 : TEXCOORD1;
+    float4 htexcoord2 : TEXCOORD2;
+    float4 htexcoord3 : TEXCOORD3;
+    float4 htexcoord4 : TEXCOORD4;
+    float4 position   : SV_Position;
+    bool   facing     : SV_IsFrontFace;
+};
+
+float4 main(PS_IN input) : SV_Target {
+    float2 uv = input.texcoord0.xy;
+    float4 albedo = texAlbedo.Sample(sampAlbedo, uv);
+    float opacity = saturate(albedo.a);
+    float3 linAlbedo = albedo.rgb * albedo.rgb;
+
+    float3 bumpN = texBump.Sample(sampBump, uv).xyz * 2.0 - 1.0;
+    float3 N;
+    N.x = dot(bumpN, input.htexcoord1.xyz);
+    N.y = dot(bumpN, input.htexcoord2.xyz);
+    N.z = dot(bumpN, input.htexcoord3.xyz);
+    float nLen = length(N);
+    N = (nLen > 1e-4) ? (N / nLen) : float3(0.0, 0.0, 1.0);
+    if (!input.facing) N = -N;
+    float3 V = normalize(-input.htexcoord4.xyz);
+
+    float2 screenUV = input.position.xy * renderpositiontoviewtexture.zw + renderpositiontoviewtexture.xy;
+    float3 sceneLight = max(texLightBuf.SampleLevel(sampLightBuf, screenUV, 0).rgb, float3(0.0, 0.0, 0.0));
+
+    float hemi = lerp(u_sheer.z, 1.0, N.z * 0.5 + 0.5);
+    float ndv = saturate(abs(dot(N, V)));
+    float fresnel = pow(1.0 - ndv, 2.5);
+    float softRim = fresnel * (0.14 * u_sheer.x + 0.05);
+
+    float3 selfLit = (u_sheer.x * hemi + softRim).xxx;
+    float3 combined = selfLit + sceneLight * u_sheer.y;
+    combined = combined / (1.0 + combined * u_sheer.w) * (1.0 + u_sheer.w);
+
+    float3 outRgb = linAlbedo * combined;
+    if (u_alpha.z > 0.5) {
+        return float4(outRgb, 1.0);
+    }
+    // Separate opaque cyan heart prints (opacity >= 0.92) from sheer white pajama fabric (opacity < 0.90)
+    // so all 3 sheer tiers show unmistakable visual transparency on white fabric while keeping hearts crisp & solid!
+    float heartMask = smoothstep(0.90, 0.98, opacity);
+    float sheerBase = saturate(opacity * u_alpha.x + u_alpha.y);
+    float sheerAlpha = saturate(sheerBase + fresnel * u_alpha.w * (1.0 - sheerBase));
+    float finalAlpha = lerp(sheerAlpha, 1.0, heartMask);
+    return float4(outRgb, finalAlpha);
+}
+)HLSL";
+
 struct EmissiveCBData {
     float emissiveFloor;
     float sceneWeight;
     float hemiMin;
     float rolloff;
+};
+
+struct SheerCBData {
+    float emissiveFloor;
+    float sceneWeight;
+    float hemiMin;
+    float rolloff;
+    float alphaScale;
+    float alphaBias;
+    float forceOpaque;
+    float fresnelBoost;
 };
 
 bool InitEmissiveResources(ID3D11Device* dev,
@@ -1157,9 +1702,53 @@ bool InitEmissiveResources(ID3D11Device* dev,
         return false;
     }
 
+    // Compile Sheer Semi-Transparent / Solid-Opaque Cloth PS + 32-byte CB + BlendStates
+    ID3DBlob* sCode = nullptr;
+    ID3DBlob* sErrs = nullptr;
+    hr = fnCompile(kSheerPSHlsl, std::strlen(kSheerPSHlsl), "tew1_sheer_cloth.hlsl",
+                   nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sCode, &sErrs);
+    if (SUCCEEDED(hr) && sCode) {
+        rawCreatePS(dev, sCode->GetBufferPointer(), sCode->GetBufferSize(), nullptr, &g_sheerPS);
+        sCode->Release();
+        D3D11_BUFFER_DESC sbdBuf{};
+        sbdBuf.ByteWidth = sizeof(SheerCBData);
+        sbdBuf.Usage = D3D11_USAGE_DEFAULT;
+        sbdBuf.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        SheerCBData sheerInit{0.16f, 1.05f, 0.82f, 0.18f, 0.55f, 0.20f, 0.0f, 0.06f};
+        D3D11_SUBRESOURCE_DATA ssrd{&sheerInit, 0, 0};
+        rawCreateBuf(dev, &sbdBuf, &ssrd, &g_sheerCB);
+
+        D3D11_BLEND_DESC sbd{};
+        sbd.AlphaToCoverageEnable = FALSE;
+        sbd.IndependentBlendEnable = FALSE;
+        sbd.RenderTarget[0].BlendEnable = TRUE;
+        sbd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        sbd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        sbd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        sbd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        sbd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        sbd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        sbd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        dev->CreateBlendState(&sbd, &g_sheerBlend);
+
+        D3D11_BLEND_DESC obd{};
+        obd.AlphaToCoverageEnable = FALSE;
+        obd.IndependentBlendEnable = FALSE;
+        obd.RenderTarget[0].BlendEnable = FALSE;
+        obd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        dev->CreateBlendState(&obd, &g_opaqueBlend);
+
+        LogFmt("Sheer/Opaque Cloth PS & BlendStates ready (ps=%p, cb=%p, sheerBlend=%p, opaqueBlend=%p).\n",
+               g_sheerPS, g_sheerCB, g_sheerBlend, g_opaqueBlend);
+    } else if (sErrs) {
+        LogFmt("Sheer PS compile error: %s\n", static_cast<const char*>(sErrs->GetBufferPointer()));
+        sErrs->Release();
+    }
+
     LogFmt("Character Self-Illumination PS compiled & ready (F7=Soft, F8=Bright, F9=Full).\n");
     return true;
 }
+
 
 // ============================================================================
 // XA2_SoundVoice::Start Inline Hook (Auto Hurt/Death Facial Triggers + Audio Log)
@@ -1453,6 +2042,62 @@ HRESULT STDMETHODCALLTYPE HookCreatePixelShader(ID3D11Device* dev, const void* b
     return hr;
 }
 
+inline void PinTrackedVBLocked(ID3D11Buffer* vb) {
+    if (!vb) return;
+    uint64_t fc = g_frameCount.load(std::memory_order_relaxed);
+    auto it = g_pinnedVBs.find(vb);
+    if (it == g_pinnedVBs.end()) {
+        vb->AddRef();
+        g_pinnedVBs[vb] = fc;
+    } else {
+        it->second = fc;
+    }
+}
+
+void GarbageCollectUnloadedVBs(uint64_t fc) {
+    if ((fc % 120) != 0) return;
+    std::vector<ID3D11Buffer*> toRelease;
+    size_t remaining = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        for (auto it = g_pinnedVBs.begin(); it != g_pinnedVBs.end(); ) {
+            ID3D11Buffer* vb = it->first;
+            uint64_t lastSeen = it->second;
+            if (fc > lastSeen + 180) {
+                vb->AddRef();
+                ULONG rc = vb->Release();
+                if (rc <= 1) {
+                    // Only our pin remains -> TEW1 already unloaded this chapter/checkpoint VB!
+                    g_vbs.erase(vb);
+                    g_charVBs.erase(vb);
+                    g_vbVariantGroup.erase(vb);
+                    g_loggedSheerVBs.erase(vb);
+                    auto vit = g_variantVBs.find(vb);
+                    if (vit != g_variantVBs.end()) {
+                        if (vit->second.sheerVB) {
+                            g_loggedSheerVBs.erase(vit->second.sheerVB);
+                            toRelease.push_back(vit->second.sheerVB);
+                        }
+                        g_variantVBs.erase(vit);
+                    }
+                    toRelease.push_back(vb);
+                    it = g_pinnedVBs.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+        remaining = g_pinnedVBs.size();
+    }
+    for (ID3D11Buffer* b : toRelease) {
+        b->Release();
+    }
+    if (!toRelease.empty()) {
+        LogFmt("GC cleanly released %zu unloaded chapter GPU buffers (remaining pinned VBs=%zu)\n",
+               toRelease.size(), remaining);
+    }
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateBuffer(ID3D11Device* dev, const D3D11_BUFFER_DESC* desc,
                                            const D3D11_SUBRESOURCE_DATA* init, ID3D11Buffer** outBuf) {
     HRESULT hr = origCreateBuffer(dev, desc, init, outBuf);
@@ -1462,6 +2107,12 @@ HRESULT STDMETHODCALLTYPE HookCreateBuffer(ID3D11Device* dev, const D3D11_BUFFER
         std::lock_guard<std::mutex> lk(g_mtx);
         g_vbs.erase(*outBuf);
         g_charVBs.erase(*outBuf);
+        g_vbVariantGroup.erase(*outBuf);
+        auto oldVit = g_variantVBs.find(*outBuf);
+        if (oldVit != g_variantVBs.end()) {
+            if (oldVit->second.sheerVB) oldVit->second.sheerVB->Release();
+            g_variantVBs.erase(oldVit);
+        }
         g_cbs.erase(*outBuf);
     }
 
@@ -1477,19 +2128,72 @@ HRESULT STDMETHODCALLTYPE HookCreateBuffer(ID3D11Device* dev, const D3D11_BUFFER
         const uint32_t vc = desc->ByteWidth / 32;
         const uint8_t* raw = static_cast<const uint8_t*>(init->pSysMem);
         const uint8_t headRemap = raw[28];
+        const uint8_t lastRemap = raw[(size_t)(vc - 1) * 32 + 28];
+
+        // Tag clothing variant group if matched & cache neutral + NaN-discard VBs (+ twin sheerVB for sheer cloth!)
+        // (NaN vertex positions discard primitives cleanly in Depth-Prepass, Shadows, Velocity, Forward, AND all Deferred Contexts!)
+        for (size_t vi = 0; vi < g_pack.variants.size(); vi++) {
+            for (const auto& vfp : g_pack.variants[vi].fps) {
+                if (vfp.vertCount == vc && MatchFirst3Pos(raw, vfp.first3Pos)) {
+                    bool sheerCapable = IsSheerVariantLabel(g_pack.variants[vi].label);
+                    ID3D11Buffer* twinSheerVB = nullptr;
+                    if (sheerCapable) {
+                        D3D11_BUFFER_DESC sdesc = *desc;
+                        sdesc.Usage = D3D11_USAGE_DEFAULT;
+                        sdesc.CPUAccessFlags = 0;
+                        origCreateBuffer(dev, &sdesc, init, &twinSheerVB);
+                    }
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    g_vbVariantGroup[*outBuf] = static_cast<int>(vi);
+                    VariantVBState vst;
+                    vst.groupIdx = static_cast<int>(vi);
+                    vst.isSheerCloth = sheerCapable;
+                    vst.sheerVB = twinSheerVB;
+                    vst.neutralVerts.assign(raw, raw + desc->ByteWidth);
+                    vst.hiddenVerts = vst.neutralVerts;
+                    const uint32_t qnan = 0x7FC00000u;
+                    for (uint32_t k = 0; k < vc; k++) {
+                        uint8_t* hv = vst.hiddenVerts.data() + (size_t)k * 32;
+                        memcpy(hv + 0, &qnan, 4);
+                        memcpy(hv + 4, &qnan, 4);
+                        memcpy(hv + 8, &qnan, 4);
+                    }
+                    g_variantVBs[*outBuf] = std::move(vst);
+                    PinTrackedVBLocked(*outBuf);
+                    if (sheerCapable) {
+                        g_loggedSheerVBs.erase(twinSheerVB);
+                        g_emissiveDirty.store(true);
+                    }
+                    LogFmt("Tagged Variant[%zu] VB %p (verts=%u, sheer=%d, sheerVB=%p)\n",
+                           vi, *outBuf, vc, sheerCapable ? 1 : 0, twinSheerVB);
+                    break;
+                }
+            }
+        }
 
         for (const auto& fp : g_pack.hairFps) {
-            if (fp.vertCount == vc && fp.headRemap == headRemap && MatchFirst3Pos(raw, fp.first3Pos)) {
+            bool boneOk = false;
+            if (fp.useVert0Remap == 2) {
+                boneOk = (fp.vert0Remap == headRemap && fp.vertLastRemap == lastRemap);
+            } else if (fp.useVert0Remap == 1) {
+                boneOk = (fp.vert0Remap == headRemap);
+            } else {
+                boneOk = (fp.matchAnyBone || fp.headRemap == headRemap);
+            }
+            if (fp.vertCount == vc && boneOk && MatchFirst3Pos(raw, fp.first3Pos)) {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 TrackedSurfaceVB tvb;
                 tvb.isHair = true;
-                tvb.headRemap = headRemap;
+                tvb.headRemap = fp.headRemap;
                 tvb.vertCount = vc;
+                tvb.weightOffset = fp.weightOffset;
                 tvb.neutralVerts.assign(raw, raw + desc->ByteWidth);
                 tvb.workVerts = tvb.neutralVerts;
                 g_vbs[*outBuf] = std::move(tvb);
                 g_charVBs.insert(*outBuf);
-                LogFmt("Hooked Dynamic HAIR VB %p (verts=%u, headRemap=%u)\n", *outBuf, vc, headRemap);
+                PinTrackedVBLocked(*outBuf);
+                LogFmt("Hooked Dynamic PHYSICS VB %p (verts=%u, headRemap=%u, v0=%u, wOff=%u)\n",
+                       *outBuf, vc, fp.headRemap, headRemap, fp.weightOffset);
                 return hr;
             }
         }
@@ -1506,6 +2210,7 @@ HRESULT STDMETHODCALLTYPE HookCreateBuffer(ID3D11Device* dev, const D3D11_BUFFER
                 tvb.workVerts = tvb.neutralVerts;
                 g_vbs[*outBuf] = std::move(tvb);
                 g_charVBs.insert(*outBuf);
+                PinTrackedVBLocked(*outBuf);
                 LogFmt("Hooked Dynamic FACE part=%u VB %p (verts=%u, headRemap=%u)\n", fa.part, *outBuf, vc, headRemap);
                 return hr;
             }
@@ -1569,30 +2274,55 @@ void CaptureBoundSurfaceState(CtxBoundState& cs) {
 }
 
 void UpdateEmissiveCBIfNeeded() {
-    if (!g_emissiveCB || !g_immCtx) return;
+    if (!g_immCtx) return;
     if (!g_emissiveDirty.exchange(false)) return;
 
     int mode = g_emissiveMode.load();
+    int sheerMode = g_sheerClothMode.load();
     EmissiveCBData cb{};
+    SheerCBData sheerCb{};
     if (mode == 1) {
         // F7 Soft Emissive: keeps dramatic lighting while lifting dark shadows clearly
         cb = {0.28f, 0.85f, 0.84f, 0.22f};
+        sheerCb.emissiveFloor = 0.30f; sheerCb.sceneWeight = 0.85f; sheerCb.hemiMin = 0.84f; sheerCb.rolloff = 0.22f;
     } else if (mode == 2) {
         // F8 Bright Anime Emissive: vivid luminous character look in any room
         cb = {0.62f, 0.55f, 0.88f, 0.28f};
-    } else {
+        sheerCb.emissiveFloor = 0.62f; sheerCb.sceneWeight = 0.55f; sheerCb.hemiMin = 0.88f; sheerCb.rolloff = 0.28f;
+    } else if (mode == 3) {
         // F9 Full Unlit Glow: showcase-grade maximum self-illumination
         cb = {1.05f, 0.22f, 0.92f, 0.30f};
+        sheerCb.emissiveFloor = 1.05f; sheerCb.sceneWeight = 0.22f; sheerCb.hemiMin = 0.92f; sheerCb.rolloff = 0.30f;
+    } else {
+        // mode == 0: balanced vanilla lighting floor for luminous yet clear sheer fabric
+        cb = {0.28f, 0.85f, 0.84f, 0.22f};
+        sheerCb.emissiveFloor = 0.16f; sheerCb.sceneWeight = 1.05f; sheerCb.hemiMin = 0.82f; sheerCb.rolloff = 0.18f;
     }
+
+    if (sheerMode == 0) {
+        // 0 = 100% Solid Opaque (ignores BC3 alpha completely!)
+        sheerCb.alphaScale = 0.0f; sheerCb.alphaBias = 1.0f; sheerCb.forceOpaque = 1.0f; sheerCb.fresnelBoost = 0.0f;
+    } else if (sheerMode == 1) {
+        // 1 = High Sheer (ultra-clear chiffon: white fabric ~0.22..0.46, hearts 1.00)
+        sheerCb.alphaScale = 0.50f; sheerCb.alphaBias = 0.04f; sheerCb.forceOpaque = 0.0f; sheerCb.fresnelBoost = 0.05f;
+    } else if (sheerMode == 2) {
+        // 2 = Medium Sheer (DEFAULT sweet spot: white fabric ~0.42..0.62, hearts 1.00)
+        sheerCb.alphaScale = 0.55f; sheerCb.alphaBias = 0.20f; sheerCb.forceOpaque = 0.0f; sheerCb.fresnelBoost = 0.06f;
+    } else {
+        // 3 = Soft Rich Sheer (+20% fuller veil: white fabric ~0.60..0.78, hearts 1.00)
+        sheerCb.alphaScale = 0.50f; sheerCb.alphaBias = 0.40f; sheerCb.forceOpaque = 0.0f; sheerCb.fresnelBoost = 0.07f;
+    }
+
     auto orig = GetCtxOrig(g_immCtx);
     if (orig.updateSub) {
         t_inInternalUpdate = true;
-        orig.updateSub(g_immCtx, g_emissiveCB, 0, nullptr, &cb, 0, 0);
+        if (g_emissiveCB) orig.updateSub(g_immCtx, g_emissiveCB, 0, nullptr, &cb, 0, 0);
+        if (g_sheerCB)    orig.updateSub(g_immCtx, g_sheerCB, 0, nullptr, &sheerCb, 0, 0);
         t_inInternalUpdate = false;
     }
 }
 
-void UpdateAllAtFrameBoundary() {
+void UpdateAllAtFrameBoundary(IDXGISwapChain* sc) {
     if (!g_pack.loaded || !g_immCtx) return;
 
     // Re-check immediate context vtable in case d3d11.dll swapped CContext::lpVtbl dynamically!
@@ -1607,7 +2337,7 @@ void UpdateAllAtFrameBoundary() {
                (unsigned long long)g_emissiveDrawCount.load());
     }
 
-    PollHotkeys();
+    PollHotkeys(sc);
     UpdateEmissiveCBIfNeeded();
 
     LARGE_INTEGER now{};
@@ -1616,6 +2346,7 @@ void UpdateAllAtFrameBoundary() {
     auto orig = GetCtxOrig(g_immCtx);
     if (!orig.updateSub) return;
 
+    {
     std::lock_guard<std::mutex> lk(g_mtx);
 
     for (auto& kv : g_chars) {
@@ -1642,11 +2373,30 @@ void UpdateAllAtFrameBoundary() {
         }
     }
 
+    const bool sheerActive = (g_sheerClothMode.load() > 0) && g_sheerPS && g_sheerCB && g_sheerBlend;
+
     for (auto& kv : g_vbs) {
         ID3D11Buffer* vbPtr = kv.first;
         TrackedSurfaceVB& tvb = kv.second;
         if (!tvb.seenThisFrame) continue;
         tvb.seenThisFrame = false;
+        auto pit = g_pinnedVBs.find(vbPtr);
+        if (pit != g_pinnedVBs.end()) pit->second = fc;
+
+        // Route physics uploads cleanly when this VB is also a clothing variant (e.g. chest physics on sheer pajama!):
+        // - If user hid this clothing variant: skip upload so origVB stays NaN-hidden!
+        // - If Sheer Cloth Mode is ON for this variant: upload live physics into sheerVB (keeping origVB NaN-hidden from Depth-Prepass!)
+        ID3D11Buffer* uploadTarget = vbPtr;
+        auto vit = g_variantVBs.find(vbPtr);
+        if (vit != g_variantVBs.end()) {
+            int gi = vit->second.groupIdx;
+            if (gi >= 0 && gi < (int)kMaxVariants && g_variantHidden[gi].load()) {
+                continue;
+            }
+            if (sheerActive && vit->second.isSheerCloth && vit->second.sheerVB) {
+                uploadTarget = vit->second.sheerVB;
+            }
+        }
 
         auto cit = g_chars.find(tvb.headRemap);
         if (cit == g_chars.end()) continue;
@@ -1675,9 +2425,38 @@ void UpdateAllAtFrameBoundary() {
         }
 
         t_inInternalUpdate = true;
-        orig.updateSub(g_immCtx, vbPtr, 0, nullptr, tvb.workVerts.data(), 0, 0);
+        orig.updateSub(g_immCtx, uploadTarget, 0, nullptr, tvb.workVerts.data(), 0, 0);
         t_inInternalUpdate = false;
     }
+
+    // Apply NaN-discard hide / neutral restore for ALL live clothing variant VBs
+    // - Hidden variant -> origVB has NaN (invisible in Depth-Prepass, Shadows, Velocity, Forward, & Deferred Contexts!)
+    // - Visible sheer cloth (sheerActive=true) -> origVB has NaN (ZERO depth-prepass occlusion of body/nipples/innerwear!),
+    //   while sheerVB renders in Forward Pass with true Blender SRC_ALPHA transparency!
+    // - Visible opaque cloth (sheerActive=false) -> origVB has neutralVerts (or live physics verts above!)
+    for (auto& kv : g_variantVBs) {
+        ID3D11Buffer* vbPtr = kv.first;
+        VariantVBState& vst = kv.second;
+        if (!vst.seenThisFrame) continue;
+        vst.seenThisFrame = false;
+        auto pit = g_pinnedVBs.find(vbPtr);
+        if (pit != g_pinnedVBs.end()) pit->second = fc;
+        if (vst.groupIdx < 0 || vst.groupIdx >= (int)kMaxVariants) continue;
+        bool wantHidden = g_variantHidden[vst.groupIdx].load();
+        bool wantSheer = (!wantHidden && sheerActive && vst.isSheerCloth && vst.sheerVB != nullptr);
+        bool wantOrigNaN = wantHidden || wantSheer;
+        if (wantOrigNaN != vst.origHasNaN) {
+            const uint8_t* srcBuf = wantOrigNaN ? vst.hiddenVerts.data() : vst.neutralVerts.data();
+            t_inInternalUpdate = true;
+            orig.updateSub(g_immCtx, vbPtr, 0, nullptr, srcBuf, 0, 0);
+            t_inInternalUpdate = false;
+            vst.origHasNaN = wantOrigNaN;
+            LogFmt("Variant[%d] VB %p -> %s\n", vst.groupIdx, vbPtr,
+                   wantHidden ? "HIDDEN (NaN)" : (wantSheer ? "SHEER (orig=NaN, sheerVB=LIVE)" : "OPAQUE (LIVE)"));
+        }
+    }
+    } // unlock g_mtx before GC COM Release
+    GarbageCollectUnloadedVBs(fc);
 }
 
 bool ShouldApplyEmissiveNow(const CtxBoundState& cs) {
@@ -1701,21 +2480,528 @@ bool ShouldApplyEmissiveNow(const CtxBoundState& cs) {
     return isFwdPS;
 }
 
+const char* kOverlayVSHlsl = R"(
+struct VSOut {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+VSOut main(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uvs[4] = { float2(0,0), float2(1,0), float2(0,1), float2(1,1) };
+    o.uv = uvs[id];
+    o.pos = float4(o.uv.x * 2.0f - 1.0f, 1.0f - o.uv.y * 2.0f, 0.0f, 1.0f);
+    return o;
+}
+)";
+
+const char* kOverlayPSHlsl = R"(
+Texture2D<float4> texUI : register(t0);
+SamplerState sampUI : register(s0);
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    return texUI.Sample(sampUI, uv);
+}
+)";
+
+bool EnsureOverlayResources(ID3D11Device* dev, int texW, int texH) {
+    if (!dev) return false;
+    if (!g_uiVS || !g_uiPS) {
+        HMODULE hComp = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (!hComp) hComp = LoadLibraryW(L"d3dcompiler_43.dll");
+        if (!hComp) return false;
+        using pD3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
+                                            LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto fnCompile = reinterpret_cast<pD3DCompile>(GetProcAddress(hComp, "D3DCompile"));
+        if (!fnCompile) return false;
+
+        ID3DBlob* vsCode = nullptr;
+        ID3DBlob* psCode = nullptr;
+        if (FAILED(fnCompile(kOverlayVSHlsl, std::strlen(kOverlayVSHlsl), "tew1_ui_vs.hlsl",
+                             nullptr, nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsCode, nullptr)) || !vsCode)
+            return false;
+        if (FAILED(fnCompile(kOverlayPSHlsl, std::strlen(kOverlayPSHlsl), "tew1_ui_ps.hlsl",
+                             nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psCode, nullptr)) || !psCode) {
+            vsCode->Release();
+            return false;
+        }
+        dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_uiVS);
+        if (origCreatePS) {
+            origCreatePS(dev, psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &g_uiPS);
+        } else {
+            dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &g_uiPS);
+        }
+        vsCode->Release();
+        psCode->Release();
+        if (!g_uiVS || !g_uiPS) return false;
+
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        dev->CreateBlendState(&bd, &g_uiBlend);
+
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        dev->CreateSamplerState(&sd, &g_uiSampler);
+
+        D3D11_RASTERIZER_DESC rsd{};
+        rsd.FillMode = D3D11_FILL_SOLID;
+        rsd.CullMode = D3D11_CULL_NONE;
+        rsd.ScissorEnable = FALSE;
+        rsd.DepthClipEnable = FALSE;
+        dev->CreateRasterizerState(&rsd, &g_uiRS);
+
+        D3D11_DEPTH_STENCIL_DESC dsd{};
+        dsd.DepthEnable = FALSE;
+        dsd.StencilEnable = FALSE;
+        dev->CreateDepthStencilState(&dsd, &g_uiDSS);
+    }
+
+    if (!g_uiTex || g_uiTexW != texW || g_uiTexH != texH) {
+        if (g_uiSRV) { g_uiSRV->Release(); g_uiSRV = nullptr; }
+        if (g_uiTex) { g_uiTex->Release(); g_uiTex = nullptr; }
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = texW;
+        td.Height = texH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &g_uiTex)) || !g_uiTex) return false;
+        if (FAILED(dev->CreateShaderResourceView(g_uiTex, nullptr, &g_uiSRV)) || !g_uiSRV) return false;
+        g_uiTexW = texW;
+        g_uiTexH = texH;
+    }
+    return true;
+}
+
+void RedrawOverlayTexture(ID3D11DeviceContext* ctx) {
+    const int nVar = static_cast<int>(g_pack.variants.size());
+    const bool hasSheerRow = HasAnySheerVariant();
+    const int hotkeyRowIdx = nVar + (hasSheerRow ? 1 : 0);
+    const int totalRows = hotkeyRowIdx + 1;
+    const int w = kOverlayW;
+    const int h = kOverlayHeaderH + totalRows * kOverlayRowH + kOverlayFooterH;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC memDC = CreateCompatibleDC(nullptr);
+    HBITMAP dib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        if (dib) DeleteObject(dib);
+        DeleteDC(memDC);
+        return;
+    }
+    HGDIOBJ oldBmp = SelectObject(memDC, dib);
+
+    auto fillRect = [&](int rx, int ry, int rw, int rh, uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
+        int x0 = std::max(0, rx), y0 = std::max(0, ry);
+        int x1 = std::min(w, rx + rw), y1 = std::min(h, ry + rh);
+        uint32_t px = (uint32_t(a) << 24) | (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
+        uint32_t* p = static_cast<uint32_t*>(bits);
+        for (int yy = y0; yy < y1; yy++) {
+            for (int xx = x0; xx < x1; xx++) p[yy * w + xx] = px;
+        }
+    };
+
+    fillRect(0, 0, w, h, 225, 16, 19, 27);
+    fillRect(0, 0, w, 4, 255, 220, 53, 69);
+    fillRect(0, h - 2, w, 2, 180, 70, 82, 104);
+    fillRect(0, 0, 2, h, 180, 70, 82, 104);
+    fillRect(w - 2, 0, 2, h, 180, 70, 82, 104);
+
+    HFONT fTitle = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei");
+    HFONT fRow   = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei");
+    HFONT fHint  = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei");
+    SetBkMode(memDC, TRANSPARENT);
+
+    auto drawText = [&](HFONT f, int tx, int ty, int tw, int th, COLORREF col, const wchar_t* str, UINT fmt) {
+        SelectObject(memDC, f);
+        SetTextColor(memDC, col);
+        RECT rc{tx, ty, tx + tw, ty + th};
+        DrawTextW(memDC, str, -1, &rc, fmt | DT_VCENTER | DT_SINGLELINE);
+        uint32_t* p = static_cast<uint32_t*>(bits);
+        int x0 = std::max(0, tx), y0 = std::max(0, ty);
+        int x1 = std::min(w, tx + tw), y1 = std::min(h, ty + th);
+        for (int yy = y0; yy < y1; yy++) {
+            for (int xx = x0; xx < x1; xx++) {
+                uint32_t& c = p[yy * w + xx];
+                if ((c >> 24) == 0) c |= 0xFF000000u;
+            }
+        }
+    };
+
+    wchar_t curKeyW[24] = {};
+    GetVkLabelW(g_panelToggleVK.load(), curKeyW, 24);
+    wchar_t titleBuf[96] = {};
+    swprintf_s(titleBuf, L"服装差分切换面板  [%ls 键关闭]", curKeyW);
+    drawText(fTitle, 16, 8, w - 32, 32, RGB(248, 250, 252), titleBuf, DT_LEFT);
+    drawText(fHint, 16, 38, w - 32, 20, RGB(156, 163, 175), L"按 1-9 / 方向键+回车 / 鼠标点击切换 | 0 一键全脱/全穿", DT_LEFT);
+    fillRect(14, kOverlayHeaderH - 2, w - 28, 1, 120, 80, 92, 112);
+
+    int cursor = g_overlayCursor.load();
+    for (int i = 0; i < nVar; i++) {
+        int ry = kOverlayHeaderH + i * kOverlayRowH;
+        bool hid = g_variantHidden[i].load();
+        bool sel = (i == cursor);
+        if (sel) {
+            fillRect(10, ry + 2, w - 20, kOverlayRowH - 4, 210, 42, 52, 74);
+        }
+        wchar_t line[96];
+        swprintf_s(line, L"[%d]  %ls", i + 1, g_pack.variants[i].label);
+        drawText(fRow, 20, ry + 2, w - 130, kOverlayRowH - 4,
+                 hid ? RGB(148, 163, 184) : RGB(241, 245, 249), line, DT_LEFT);
+
+        fillRect(w - 96, ry + 6, 76, kOverlayRowH - 12, 230,
+                 hid ? 75 : 34, hid ? 85 : 150, hid ? 99 : 84);
+        drawText(fHint, w - 96, ry + 6, 76, kOverlayRowH - 12,
+                 RGB(255, 255, 255), hid ? L"已隐藏" : L"显示中", DT_CENTER);
+    }
+
+    if (hasSheerRow) {
+        int ry = kOverlayHeaderH + nVar * kOverlayRowH;
+        int sm = g_sheerClothMode.load();
+        bool sel = (nVar == cursor);
+        if (sel) {
+            fillRect(10, ry + 2, w - 20, kOverlayRowH - 4, 210, 42, 52, 74);
+        }
+        fillRect(16, ry, w - 32, 1, 90, 95, 110, 134);
+        wchar_t line[96];
+        swprintf_s(line, L"[%d]  睡衣外套透明度（4档切换）", nVar + 1);
+        drawText(fRow, 20, ry + 2, w - 130, kOverlayRowH - 4,
+                 sm > 0 ? RGB(125, 211, 252) : RGB(226, 232, 240), line, DT_LEFT);
+
+        static const wchar_t* kSheerTags[4] = {L"不透明", L"高透纱", L"中透纱", L"微透纱"};
+        static const uint8_t kPillCol[4][3] = {
+            {75, 85, 99},
+            {139, 92, 246},
+            {14, 165, 233},
+            {56, 189, 248},
+        };
+        int si = (sm >= 0 && sm < 4) ? sm : 0;
+        fillRect(w - 96, ry + 6, 76, kOverlayRowH - 12, 235,
+                 kPillCol[si][0], kPillCol[si][1], kPillCol[si][2]);
+        drawText(fHint, w - 96, ry + 6, 76, kOverlayRowH - 12,
+                 RGB(255, 255, 255), kSheerTags[si], DT_CENTER);
+    }
+
+    {
+        int ry = kOverlayHeaderH + hotkeyRowIdx * kOverlayRowH;
+        bool rebinding = g_rebindingKey.load();
+        bool sel = (hotkeyRowIdx == cursor);
+        if (sel) {
+            fillRect(10, ry + 2, w - 20, kOverlayRowH - 4, 210, 42, 52, 74);
+        }
+        fillRect(16, ry, w - 32, 1, 90, 95, 110, 134);
+        wchar_t line[96];
+        swprintf_s(line, L"[%d]  %ls", hotkeyRowIdx + 1,
+                   rebinding ? L"请按下新的开关快捷键（ESC取消）" : L"自定义面板快捷键（点此改键）");
+        drawText(fRow, 20, ry + 2, w - 130, kOverlayRowH - 4,
+                 rebinding ? RGB(251, 191, 36) : RGB(226, 232, 240), line, DT_LEFT);
+
+        fillRect(w - 96, ry + 6, 76, kOverlayRowH - 12, 235,
+                 rebinding ? 217 : 71, rebinding ? 119 : 85, rebinding ? 6 : 105);
+        drawText(fHint, w - 96, ry + 6, 76, kOverlayRowH - 12,
+                 RGB(255, 255, 255), rebinding ? L"等待按键" : curKeyW, DT_CENTER);
+    }
+
+    int fy = kOverlayHeaderH + totalRows * kOverlayRowH;
+    fillRect(14, fy + 2, w - 28, 1, 120, 80, 92, 112);
+    drawText(fHint, 16, fy + 6, w - 32, kOverlayFooterH - 8,
+             RGB(250, 204, 21), L"[0] 一键全脱 / 一键全穿   ·   [F7/F8/F9] 自发光   [F10] 表情", DT_CENTER);
+
+    auto orig = GetCtxOrig(ctx);
+    if (orig.updateSub && g_uiTex) {
+        t_inInternalUpdate = true;
+        orig.updateSub(ctx, g_uiTex, 0, nullptr, bits, w * 4, 0);
+        t_inInternalUpdate = false;
+    }
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(fTitle); DeleteObject(fRow); DeleteObject(fHint);
+    DeleteObject(dib);
+    DeleteDC(memDC);
+}
+
+void RenderVariantOverlay(IDXGISwapChain* sc) {
+    if (!g_overlayOpen.load() || g_pack.variants.empty() || !g_device || !g_immCtx || !sc) return;
+    const int nVar = static_cast<int>(g_pack.variants.size());
+    const int totalRows = nVar + (HasAnySheerVariant() ? 1 : 0) + 1;
+    const int texW = kOverlayW;
+    const int texH = kOverlayHeaderH + totalRows * kOverlayRowH + kOverlayFooterH;
+
+    if (!EnsureOverlayResources(g_device, texW, texH)) return;
+    if (g_overlayDirty.exchange(false)) {
+        RedrawOverlayTexture(g_immCtx);
+    }
+
+    ID3D11Texture2D* backBuf = nullptr;
+    if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuf))) || !backBuf) return;
+    ID3D11RenderTargetView* rtv = nullptr;
+    HRESULT hr = g_device->CreateRenderTargetView(backBuf, nullptr, &rtv);
+    backBuf->Release();
+    if (FAILED(hr) || !rtv) return;
+
+    ID3D11RenderTargetView* oldRTVs[4] = {};
+    ID3D11DepthStencilView* oldDSV = nullptr;
+    g_immCtx->OMGetRenderTargets(4, oldRTVs, &oldDSV);
+    ID3D11BlendState* oldBlend = nullptr;
+    FLOAT oldBF[4] = {};
+    UINT oldMask = 0;
+    g_immCtx->OMGetBlendState(&oldBlend, oldBF, &oldMask);
+    ID3D11RasterizerState* oldRS = nullptr;
+    g_immCtx->RSGetState(&oldRS);
+    ID3D11DepthStencilState* oldDSS = nullptr;
+    UINT oldStencilRef = 0;
+    g_immCtx->OMGetDepthStencilState(&oldDSS, &oldStencilRef);
+    D3D11_VIEWPORT oldVPs[16] = {};
+    UINT numVPs = 16;
+    g_immCtx->RSGetViewports(&numVPs, oldVPs);
+    ID3D11InputLayout* oldIL = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY oldTopo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    g_immCtx->IAGetInputLayout(&oldIL);
+    g_immCtx->IAGetPrimitiveTopology(&oldTopo);
+    ID3D11VertexShader* oldVS = nullptr;
+    ID3D11PixelShader* oldPS = nullptr;
+    g_immCtx->VSGetShader(&oldVS, nullptr, nullptr);
+    g_immCtx->PSGetShader(&oldPS, nullptr, nullptr);
+
+    t_inInternalDraw = true;
+    auto orig = GetCtxOrig(g_immCtx);
+    g_immCtx->OMSetRenderTargets(1, &rtv, nullptr);
+    if (g_uiRS)  g_immCtx->RSSetState(g_uiRS);
+    if (g_uiDSS) g_immCtx->OMSetDepthStencilState(g_uiDSS, 0);
+    D3D11_VIEWPORT vp{float(kOverlayX), float(kOverlayY), float(texW), float(texH), 0.f, 1.f};
+    g_immCtx->RSSetViewports(1, &vp);
+    g_immCtx->OMSetBlendState(g_uiBlend, nullptr, 0xFFFFFFFF);
+    g_immCtx->IASetInputLayout(nullptr);
+    g_immCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    if (orig.vsSetShader) orig.vsSetShader(g_immCtx, g_uiVS, nullptr, 0);
+    if (orig.psSetShader) orig.psSetShader(g_immCtx, g_uiPS, nullptr, 0);
+    if (orig.psSetSRV)    orig.psSetSRV(g_immCtx, 0, 1, &g_uiSRV);
+    g_immCtx->PSSetSamplers(0, 1, &g_uiSampler);
+    g_immCtx->Draw(4, 0);
+
+    g_immCtx->OMSetRenderTargets(4, oldRTVs, oldDSV);
+    g_immCtx->OMSetBlendState(oldBlend, oldBF, oldMask);
+    g_immCtx->RSSetState(oldRS);
+    g_immCtx->OMSetDepthStencilState(oldDSS, oldStencilRef);
+    if (numVPs > 0) g_immCtx->RSSetViewports(numVPs, oldVPs);
+    g_immCtx->IASetInputLayout(oldIL);
+    g_immCtx->IASetPrimitiveTopology(oldTopo);
+    if (orig.vsSetShader) orig.vsSetShader(g_immCtx, oldVS, nullptr, 0);
+    if (orig.psSetShader) orig.psSetShader(g_immCtx, oldPS, nullptr, 0);
+    t_inInternalDraw = false;
+    ReassertDrawHooks(g_immCtx);
+
+    for (auto* r : oldRTVs) if (r) r->Release();
+    if (oldDSV) oldDSV->Release();
+    if (oldBlend) oldBlend->Release();
+    if (oldRS) oldRS->Release();
+    if (oldDSS) oldDSS->Release();
+    if (oldIL) oldIL->Release();
+    if (oldVS) oldVS->Release();
+    if (oldPS) oldPS->Release();
+    rtv->Release();
+}
+
+bool IsVariantHiddenNow(const CtxBoundState& cs) {
+    if (!cs.boundVB0 || g_pack.variants.empty()) return false;
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_vbVariantGroup.find(cs.boundVB0);
+    if (it == g_vbVariantGroup.end()) return false;
+    int idx = it->second;
+    return (idx >= 0 && idx < static_cast<int>(kMaxVariants)) ? g_variantHidden[idx].load() : false;
+}
+
+void DetectDepthDirectionOnce(ID3D11DeviceContext* ctx) {
+    if (!ctx || g_depthDirKnown.load(std::memory_order_relaxed)) return;
+    ID3D11DepthStencilState* curDSS = nullptr;
+    UINT curRef = 0;
+    ctx->OMGetDepthStencilState(&curDSS, &curRef);
+    if (!curDSS) return;
+    D3D11_DEPTH_STENCIL_DESC d{};
+    curDSS->GetDesc(&d);
+    curDSS->Release();
+    if (d.DepthEnable && d.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) {
+        if (d.DepthFunc == D3D11_COMPARISON_GREATER || d.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL) {
+            g_depthIsReverseZ.store(true);
+            if (!g_depthDirKnown.exchange(true)) {
+                LogFmt("Auto-detected Depth-Prepass direction: REVERSE-Z (DepthFunc=%d)\n", (int)d.DepthFunc);
+            }
+        } else if (d.DepthFunc == D3D11_COMPARISON_LESS || d.DepthFunc == D3D11_COMPARISON_LESS_EQUAL) {
+            g_depthIsReverseZ.store(false);
+            if (!g_depthDirKnown.exchange(true)) {
+                LogFmt("Auto-detected Depth-Prepass direction: STANDARD-Z (DepthFunc=%d)\n", (int)d.DepthFunc);
+            }
+        }
+    }
+}
+
+struct SheerDrawPlan {
+    bool active = false;
+    bool opaqueSolid = false;
+    ID3D11Buffer* vbToDraw = nullptr;
+};
+
+SheerDrawPlan GetSheerDrawPlan(const CtxBoundState& cs) {
+    SheerDrawPlan plan{};
+    if (!cs.boundVB0 || !cs.boundPS || !g_sheerPS || !g_sheerCB || !g_sheerBlend || !g_opaqueBlend) {
+        return plan;
+    }
+    int mode = g_sheerClothMode.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto vit = g_variantVBs.find(cs.boundVB0);
+    if (vit == g_variantVBs.end() || !vit->second.isSheerCloth) {
+        return plan;
+    }
+    if (g_forwardAlbedoPS.find(cs.boundPS) == g_forwardAlbedoPS.end()) {
+        return plan;
+    }
+    if (mode == 0) {
+        // Solid Opaque Mode: draw origVB with BlendEnable=FALSE + forceOpaque=1.0 so BC3 alpha NEVER bleeds or darkens!
+        plan.active = true;
+        plan.opaqueSolid = true;
+        plan.vbToDraw = cs.boundVB0;
+        plan.vbToDraw->AddRef();
+    } else if (vit->second.sheerVB) {
+        // Sheer Mode (1=HighSheer, 2=MidSheer, 3=SoftSheer): swap to sheerVB + SRC_ALPHA blend!
+        plan.active = true;
+        plan.opaqueSolid = false;
+        plan.vbToDraw = vit->second.sheerVB;
+        plan.vbToDraw->AddRef();
+    }
+    return plan;
+}
+
+ID3D11DepthStencilState* GetOrCreateSheerDSS(ID3D11DepthStencilState* oldDSS) {
+    if (!g_device) return nullptr;
+    D3D11_DEPTH_STENCIL_DESC d{};
+    if (oldDSS) {
+        oldDSS->GetDesc(&d);
+    } else {
+        d.StencilEnable = FALSE;
+    }
+    int origFunc = (int)d.DepthFunc;
+    d.DepthEnable = TRUE;
+    d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    d.DepthFunc = g_depthIsReverseZ.load() ? D3D11_COMPARISON_GREATER_EQUAL : D3D11_COMPARISON_LESS_EQUAL;
+
+    uint64_t key = (uint64_t(d.DepthFunc) & 0xF) |
+                   (uint64_t(d.StencilEnable ? 1 : 0) << 4) |
+                   (uint64_t(d.StencilReadMask) << 8) |
+                   (uint64_t(d.StencilWriteMask) << 16) |
+                   (uint64_t(d.FrontFace.StencilFunc) << 24) |
+                   (uint64_t(d.FrontFace.StencilPassOp) << 32) |
+                   (uint64_t(d.BackFace.StencilFunc) << 40);
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_sheerDSSCache.find(key);
+        if (it != g_sheerDSSCache.end()) return it->second;
+    }
+
+    ID3D11DepthStencilState* created = nullptr;
+    if (FAILED(g_device->CreateDepthStencilState(&d, &created)) || !created) return nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_sheerDSSCache.find(key);
+        if (it != g_sheerDSSCache.end()) {
+            created->Release();
+            return it->second;
+        }
+        g_sheerDSSCache[key] = created;
+    }
+    LogFmt("Created Sheer DSS %p (origFunc=%d -> newFunc=%d, stencil=%d)\n",
+           created, origFunc, (int)d.DepthFunc, (int)d.StencilEnable);
+    return created;
+}
+
+ID3D11RasterizerState* GetOrCreateDoubleSidedRS(ID3D11RasterizerState* oldRS, int* outOrigCull) {
+    if (outOrigCull) *outOrigCull = 0;
+    if (!g_device) return nullptr;
+    D3D11_RASTERIZER_DESC d{};
+    if (oldRS) {
+        oldRS->GetDesc(&d);
+    } else {
+        d.FillMode = D3D11_FILL_SOLID;
+        d.CullMode = D3D11_CULL_BACK;
+        d.DepthClipEnable = TRUE;
+    }
+    if (outOrigCull) *outOrigCull = (int)d.CullMode;
+    // Already double-sided (CULL_NONE) or explicit backface pass (CULL_FRONT) -> keep engine RS untouched
+    if (d.CullMode == D3D11_CULL_NONE || d.CullMode == D3D11_CULL_FRONT) {
+        return nullptr;
+    }
+    d.CullMode = D3D11_CULL_NONE;
+    uint64_t key = (uint64_t(d.FillMode) & 0xF) |
+                   (uint64_t(d.FrontCounterClockwise ? 1 : 0) << 4) |
+                   (uint64_t(d.ScissorEnable ? 1 : 0) << 5) |
+                   (uint64_t(d.DepthClipEnable ? 1 : 0) << 6) |
+                   (uint64_t(d.MultisampleEnable ? 1 : 0) << 7) |
+                   (uint64_t(d.AntialiasedLineEnable ? 1 : 0) << 8) |
+                   (uint64_t(uint32_t(d.DepthBias)) << 16);
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_sheerRSCache.find(key);
+        if (it != g_sheerRSCache.end()) return it->second;
+    }
+    ID3D11RasterizerState* created = nullptr;
+    if (FAILED(g_device->CreateRasterizerState(&d, &created)) || !created) return nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_sheerRSCache.find(key);
+        if (it != g_sheerRSCache.end()) {
+            created->Release();
+            return it->second;
+        }
+        g_sheerRSCache[key] = created;
+    }
+    LogFmt("Created Double-Sided RS %p (origCull=%d -> CULL_NONE, scissor=%d)\n",
+           created, outOrigCull ? *outOrigCull : -1, (int)d.ScissorEnable);
+    return created;
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    RenderVariantOverlay(sc);
     HRESULT hr = origPresent(sc, sync, flags);
-    UpdateAllAtFrameBoundary();
+    UpdateAllAtFrameBoundary(sc);
     return hr;
 }
 
 void STDMETHODCALLTYPE HookIASetVB(ID3D11DeviceContext* ctx, UINT startSlot, UINT numBufs,
                                    ID3D11Buffer* const* bufs, const UINT* strides, const UINT* offsets) {
-    if (startSlot == 0 && numBufs >= 1 && bufs) {
+    if (!t_inInternalDraw && startSlot == 0 && numBufs >= 1 && bufs) {
         auto& cs = GetCtxState(ctx);
         cs.boundVB0 = bufs[0];
-        if (cs.boundVB0) CaptureBoundSurfaceState(cs);
+        cs.boundVB0Stride = strides ? strides[0] : 32;
+        cs.boundVB0Offset = offsets ? offsets[0] : 0;
+        if (cs.boundVB0) {
+            CaptureBoundSurfaceState(cs);
+            if (!g_pack.variants.empty()) {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                auto vit = g_variantVBs.find(cs.boundVB0);
+                if (vit != g_variantVBs.end()) vit->second.seenThisFrame = true;
+            }
+        }
     }
     GetCtxOrig(ctx).iaSetVB(ctx, startSlot, numBufs, bufs, strides, offsets);
-    ReassertDrawHooks(ctx);
+    if (!t_inInternalDraw) {
+        ReassertDrawHooks(ctx);
+    }
 }
 
 void STDMETHODCALLTYPE HookVSSetCB(ID3D11DeviceContext* ctx, UINT startSlot, UINT numBufs, ID3D11Buffer* const* bufs) {
@@ -1781,8 +3067,83 @@ void STDMETHODCALLTYPE HookPSSetCB(ID3D11DeviceContext* ctx, UINT startSlot, UIN
 
 void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex) {
     g_drawIndexedCalls.fetch_add(1);
+    if (!g_depthDirKnown.load(std::memory_order_relaxed)) {
+        DetectDepthDirectionOnce(ctx);
+    }
     auto orig = GetCtxOrig(ctx);
     auto& cs = GetCtxState(ctx);
+    if (IsVariantHiddenNow(cs)) {
+        return;
+    }
+    SheerDrawPlan plan = GetSheerDrawPlan(cs);
+    if (plan.active) {
+        ID3D11BlendState* oldBlend = nullptr;
+        FLOAT oldBF[4] = {};
+        UINT oldMask = 0xFFFFFFFFu;
+        ctx->OMGetBlendState(&oldBlend, oldBF, &oldMask);
+        ID3D11RasterizerState* oldRS = nullptr;
+        ctx->RSGetState(&oldRS);
+        int origCull = 0;
+        ID3D11RasterizerState* doubleSidedRS = GetOrCreateDoubleSidedRS(oldRS, &origCull);
+        ID3D11DepthStencilState* oldDSS = nullptr;
+        UINT oldStencilRef = 0;
+        ID3D11DepthStencilState* sheerDSS = nullptr;
+        if (!plan.opaqueSolid) {
+            ctx->OMGetDepthStencilState(&oldDSS, &oldStencilRef);
+            sheerDSS = GetOrCreateSheerDSS(oldDSS);
+        }
+
+        ID3D11Buffer* origVB = cs.boundVB0;
+        UINT stride = cs.boundVB0Stride ? cs.boundVB0Stride : 32;
+        UINT offset = cs.boundVB0Offset;
+
+        t_inInternalDraw = true;
+        if (doubleSidedRS) ctx->RSSetState(doubleSidedRS);
+        if (!plan.opaqueSolid) {
+            orig.iaSetVB(ctx, 0, 1, &plan.vbToDraw, &stride, &offset);
+            ctx->OMSetBlendState(g_sheerBlend, nullptr, 0xFFFFFFFFu);
+            if (sheerDSS) ctx->OMSetDepthStencilState(sheerDSS, oldStencilRef);
+        } else {
+            ctx->OMSetBlendState(g_opaqueBlend, nullptr, 0xFFFFFFFFu);
+        }
+        orig.psSetShader(ctx, g_sheerPS, nullptr, 0);
+        orig.psSetCB(ctx, 4, 1, &g_sheerCB);
+        void** vt = *reinterpret_cast<void***>(ctx);
+        FnDrawIndexed realDraw = (vt && vt[12] != reinterpret_cast<void*>(HookDrawIndexed))
+                                 ? reinterpret_cast<FnDrawIndexed>(vt[12])
+                                 : orig.drawIndexed;
+        realDraw(ctx, indexCount, startIndex, baseVertex);
+        ID3D11Buffer* nullCB = nullptr;
+        orig.psSetCB(ctx, 4, 1, &nullCB);
+        orig.psSetShader(ctx, cs.boundPS, nullptr, 0);
+        if (!plan.opaqueSolid) {
+            ctx->OMSetDepthStencilState(oldDSS, oldStencilRef);
+            orig.iaSetVB(ctx, 0, 1, &origVB, &stride, &offset);
+        }
+        if (doubleSidedRS) ctx->RSSetState(oldRS);
+        ctx->OMSetBlendState(oldBlend, oldBF, oldMask);
+        t_inInternalDraw = false;
+        ReassertDrawHooks(ctx);
+        if (oldBlend) oldBlend->Release();
+        if (oldRS) oldRS->Release();
+        if (oldDSS) oldDSS->Release();
+        ID3D11Buffer* drawnVb = plan.vbToDraw;
+        if (plan.vbToDraw) plan.vbToDraw->Release();
+        bool logThis = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (g_loggedSheerVBs.find(drawnVb) == g_loggedSheerVBs.end()) {
+                g_loggedSheerVBs.insert(drawnVb);
+                logThis = true;
+            }
+        }
+        g_sheerDrawCount.fetch_add(1);
+        if (logThis) {
+            LogFmt("Sheer/Opaque DrawIndexed active (ctx=%p, mode=%d, vb=%p, origCull=%d, forcedDoubleSided=%d, revZ=%d)\n",
+                   ctx, g_sheerClothMode.load(), drawnVb, origCull, doubleSidedRS ? 1 : 0, g_depthIsReverseZ.load() ? 1 : 0);
+        }
+        return;
+    }
     if (ShouldApplyEmissiveNow(cs)) {
         t_inInternalDraw = true;
         orig.psSetShader(ctx, g_emissivePS, nullptr, 0);
@@ -1810,8 +3171,70 @@ void STDMETHODCALLTYPE HookDrawIndexed(ID3D11DeviceContext* ctx, UINT indexCount
 void STDMETHODCALLTYPE HookDrawIndexedInstanced(ID3D11DeviceContext* ctx, UINT indexCountPerInst, UINT instCount,
                                                 UINT startIndex, INT baseVertex, UINT startInst) {
     g_drawInstCalls.fetch_add(1);
+    if (!g_depthDirKnown.load(std::memory_order_relaxed)) {
+        DetectDepthDirectionOnce(ctx);
+    }
     auto orig = GetCtxOrig(ctx);
     auto& cs = GetCtxState(ctx);
+    if (IsVariantHiddenNow(cs)) {
+        return;
+    }
+    SheerDrawPlan plan = GetSheerDrawPlan(cs);
+    if (plan.active) {
+        ID3D11BlendState* oldBlend = nullptr;
+        FLOAT oldBF[4] = {};
+        UINT oldMask = 0xFFFFFFFFu;
+        ctx->OMGetBlendState(&oldBlend, oldBF, &oldMask);
+        ID3D11RasterizerState* oldRS = nullptr;
+        ctx->RSGetState(&oldRS);
+        int origCull = 0;
+        ID3D11RasterizerState* doubleSidedRS = GetOrCreateDoubleSidedRS(oldRS, &origCull);
+        ID3D11DepthStencilState* oldDSS = nullptr;
+        UINT oldStencilRef = 0;
+        ID3D11DepthStencilState* sheerDSS = nullptr;
+        if (!plan.opaqueSolid) {
+            ctx->OMGetDepthStencilState(&oldDSS, &oldStencilRef);
+            sheerDSS = GetOrCreateSheerDSS(oldDSS);
+        }
+
+        ID3D11Buffer* origVB = cs.boundVB0;
+        UINT stride = cs.boundVB0Stride ? cs.boundVB0Stride : 32;
+        UINT offset = cs.boundVB0Offset;
+
+        t_inInternalDraw = true;
+        if (doubleSidedRS) ctx->RSSetState(doubleSidedRS);
+        if (!plan.opaqueSolid) {
+            orig.iaSetVB(ctx, 0, 1, &plan.vbToDraw, &stride, &offset);
+            ctx->OMSetBlendState(g_sheerBlend, nullptr, 0xFFFFFFFFu);
+            if (sheerDSS) ctx->OMSetDepthStencilState(sheerDSS, oldStencilRef);
+        } else {
+            ctx->OMSetBlendState(g_opaqueBlend, nullptr, 0xFFFFFFFFu);
+        }
+        orig.psSetShader(ctx, g_sheerPS, nullptr, 0);
+        orig.psSetCB(ctx, 4, 1, &g_sheerCB);
+        void** vt = *reinterpret_cast<void***>(ctx);
+        FnDrawIndexedInstanced realDraw = (vt && vt[20] != reinterpret_cast<void*>(HookDrawIndexedInstanced))
+                                          ? reinterpret_cast<FnDrawIndexedInstanced>(vt[20])
+                                          : orig.drawIndexedInstanced;
+        realDraw(ctx, indexCountPerInst, instCount, startIndex, baseVertex, startInst);
+        ID3D11Buffer* nullCB = nullptr;
+        orig.psSetCB(ctx, 4, 1, &nullCB);
+        orig.psSetShader(ctx, cs.boundPS, nullptr, 0);
+        if (!plan.opaqueSolid) {
+            ctx->OMSetDepthStencilState(oldDSS, oldStencilRef);
+            orig.iaSetVB(ctx, 0, 1, &origVB, &stride, &offset);
+        }
+        if (doubleSidedRS) ctx->RSSetState(oldRS);
+        ctx->OMSetBlendState(oldBlend, oldBF, oldMask);
+        t_inInternalDraw = false;
+        ReassertDrawHooks(ctx);
+        if (oldBlend) oldBlend->Release();
+        if (oldRS) oldRS->Release();
+        if (oldDSS) oldDSS->Release();
+        if (plan.vbToDraw) plan.vbToDraw->Release();
+        g_sheerDrawCount.fetch_add(1);
+        return;
+    }
     if (ShouldApplyEmissiveNow(cs)) {
         t_inInternalDraw = true;
         orig.psSetShader(ctx, g_emissivePS, nullptr, 0);
@@ -1886,11 +3309,15 @@ DWORD WINAPI InitThread(void* param) {
     GetModuleFileNameW(self, dllDir, MAX_PATH);
     wchar_t* slash = wcsrchr(dllDir, L'\\');
     if (slash) *(slash + 1) = L'\0';
+    wcscpy_s(g_dllDir, dllDir);
+    LoadPanelHotkeyConfig();
 
     wchar_t logPath[MAX_PATH] = {};
     swprintf_s(logPath, L"%stew1_dyn_runtime.log", dllDir);
     g_log = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, 0, nullptr);
-    LogFmt("TEW1 Generic Dynamic Runtime v2.2 (Clean Emissive F7/F8/F9 + HurtMouthOpen F10 + NativeMouthRig) starting...\n");
+    char hkName[32] = {};
+    GetVkConfigNameA(g_panelToggleVK.load(), hkName, sizeof(hkName));
+    LogFmt("TEW1 Generic Dynamic Runtime v3.10 (Chapter-Safe COM-Pinned VBs + Auto-GC + Double-Sided Sheer + Hotkey=[%s]) starting...\n", hkName);
 
     wchar_t envVal[32] = {};
     if (GetEnvironmentVariableW(L"TEW1_DYN_HAIR", envVal, 32) > 0 && envVal[0] == L'0') g_enableHair.store(false);
