@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "tew1_bmd6"
+version = "2.5.0"
+name = "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)"
+tagline = "恶灵附身 1 BMD6 导入导出、MMD/VRChat 一键对骨重命名、免转DDS一键材质、断肢拆分、TEW Physical 实时物理与 TEW Facial 表情"
+maintainer = "TEW1 Mod Tools"
+type = "add-on"
+
+tags = ["Import-Export", "Mesh", "Rigging", "Material"]
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "读写恶灵附身 1 .bmd6model、.bimage、.decl、tew1_dyn.bin 与 Mod ZIP 资源"
