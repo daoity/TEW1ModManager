@@ -18,9 +18,10 @@ FORMAT = {
     71: (10, 8), 72: (10, 8), 77: (11, 16), 78: (11, 16),
 }
 PRESETS = {
-    "OPAQUE": (0, False, "衣服和皮肤"),
-    "HAIR": (2, False, "不透明发片"),
-    "CUTOUT": (6, True, "睫毛和透明裁切"),
+    "OPAQUE": (0, False, "衣服和皮肤 (BC1 不透明)"),
+    "HAIR": (2, False, "不透明发片 (BC1)"),
+    "CUTOUT": (6, True, "睫毛和镂空裁切 (BC3 0.33)"),
+    "SHEER_OUTER": (9, True, "透纱外套 (BC3 低裁切 0.05)"),
 }
 
 

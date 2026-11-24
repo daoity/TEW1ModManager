@@ -452,8 +452,33 @@ def _world_bone_head(arm_obj, bname):
     return (arm_obj.matrix_world @ b.head_local) if b else None
 
 
-def _align_armature_transform(src_arm, tgt_arm, std_to_main):
-    """Rotate (Z yaw), scale, and translate src_arm to match tgt_arm's facing, height and foot ground."""
+def _mesh_lowest_z_world(arm_obj, meshes=None):
+    """Find the lowest world-space vertex Z across visible non-hidden meshes bound to arm_obj."""
+    if meshes is None:
+        meshes = attached_meshes(arm_obj)
+    min_z = None
+    for obj in meshes:
+        if obj.get("tew1_zero_hide") or obj.hide_viewport or not obj.data or len(obj.data.vertices) == 0:
+            continue
+        n = len(obj.data.vertices)
+        co = np.empty(n * 3, dtype=np.float32)
+        obj.data.vertices.foreach_get("co", co)
+        pts = co.reshape(-1, 3).astype(np.float64)
+        m = np.array(obj.matrix_world, dtype=np.float64)
+        z_vals = pts @ m[2, :3] + m[2, 3]
+        z_min = float(z_vals.min())
+        if min_z is None or z_min < min_z:
+            min_z = z_min
+    return min_z
+
+
+def _align_armature_transform(src_arm, tgt_arm, std_to_main, preserve_proportions=True):
+    """Rotate (Z yaw), scale, and translate src_arm to match tgt_arm's facing, height and foot ground.
+    When preserve_proportions=True:
+    - Uses true sole-bottom Z (instead of Sebastian's tall combat-boot ankle Z) so bare feet keep 1:1 proportions and sit cleanly at Z=0.10.
+    - Aligns global X to thigh-midpoint X (prevents anterior-posterior hip/waist kink).
+    - Never widens shoulders or stretches feet.
+    """
     def get_lr(arm, l_name, r_name):
         hl = _world_bone_head(arm, l_name)
         hr = _world_bone_head(arm, r_name)
@@ -476,14 +501,23 @@ def _align_armature_transform(src_arm, tgt_arm, std_to_main):
         src_arm.matrix_world = rot_z @ src_arm.matrix_world
         bpy.context.view_layer.update()
 
-    # Scale by head-to-foot (or upperarm-to-foot) Z span
+    src_meshes = attached_meshes(src_arm)
     src_head = _world_bone_head(src_arm, std_to_main.get("head", ""))
     tgt_head = _world_bone_head(tgt_arm, "head")
     src_foot = _world_bone_head(src_arm, std_to_main.get("foot_L", "")) or _world_bone_head(src_arm, std_to_main.get("foot_R", ""))
     tgt_foot = _world_bone_head(tgt_arm, "l_foot") or _world_bone_head(tgt_arm, "r_foot")
 
+    # Determine target ground Z in world space (TEW1 Sebastian soles sit at local Z = 0.10)
+    tgt_ground_z = (tgt_arm.matrix_world @ Vector((0.0, 0.0, 0.10))).z
+    src_sole_z = _mesh_lowest_z_world(src_arm, src_meshes) if preserve_proportions else None
+
     scale = 1.0
-    if src_head and tgt_head and src_foot and tgt_foot:
+    if preserve_proportions and src_head and tgt_head and src_sole_z is not None:
+        dh_s = abs(src_head.z - src_sole_z)
+        dh_t = abs(tgt_head.z - tgt_ground_z)
+        if dh_s > 1e-4 and dh_t > 1e-4:
+            scale = dh_t / dh_s
+    elif src_head and tgt_head and src_foot and tgt_foot:
         dh_s = abs(src_head.z - src_foot.z)
         dh_t = abs(tgt_head.z - tgt_foot.z)
         if dh_s > 1e-4 and dh_t > 1e-4:
@@ -498,18 +532,219 @@ def _align_armature_transform(src_arm, tgt_arm, std_to_main):
         src_arm.scale = (src_arm.scale.x * scale, src_arm.scale.y * scale, src_arm.scale.z * scale)
         bpy.context.view_layer.update()
 
-    # Align pelvis XY and foot Z
+    # Align X/Y using thigh-midpoint (eliminates pelvis/thigh anterior-posterior kink), fallback to pelvis
+    src_tl = _world_bone_head(src_arm, std_to_main.get("thigh_L", ""))
+    src_tr = _world_bone_head(src_arm, std_to_main.get("thigh_R", ""))
+    tgt_tl = _world_bone_head(tgt_arm, "l_thigh")
+    tgt_tr = _world_bone_head(tgt_arm, "r_thigh")
     src_pel = _world_bone_head(src_arm, std_to_main.get("pelvis", ""))
     tgt_pel = _world_bone_head(tgt_arm, "pelvis")
-    src_foot = _world_bone_head(src_arm, std_to_main.get("foot_L", "")) or _world_bone_head(src_arm, std_to_main.get("foot_R", ""))
-    tgt_foot = _world_bone_head(tgt_arm, "l_foot") or _world_bone_head(tgt_arm, "r_foot")
 
-    dx = (tgt_pel.x - src_pel.x) if (src_pel and tgt_pel) else 0.0
-    dy = (tgt_pel.y - src_pel.y) if (src_pel and tgt_pel) else 0.0
-    dz = (tgt_foot.z - src_foot.z) if (src_foot and tgt_foot) else ((tgt_pel.z - src_pel.z) if (src_pel and tgt_pel) else 0.0)
+    if preserve_proportions and src_tl and src_tr and tgt_tl and tgt_tr:
+        src_hip = 0.5 * (src_tl + src_tr)
+        tgt_hip = 0.5 * (tgt_tl + tgt_tr)
+        dx = tgt_hip.x - src_hip.x
+        dy = tgt_hip.y - src_hip.y
+    else:
+        dx = (tgt_pel.x - src_pel.x) if (src_pel and tgt_pel) else 0.0
+        dy = (tgt_pel.y - src_pel.y) if (src_pel and tgt_pel) else 0.0
+
+    # Align Z from true bare-foot sole to TEW1 ground Z=0.10 (1:1 bare-foot height, zero boot stretch)
+    src_sole_z = _mesh_lowest_z_world(src_arm, src_meshes) if preserve_proportions else None
+    if preserve_proportions and src_sole_z is not None:
+        dz = tgt_ground_z - src_sole_z
+    else:
+        src_foot = _world_bone_head(src_arm, std_to_main.get("foot_L", "")) or _world_bone_head(src_arm, std_to_main.get("foot_R", ""))
+        tgt_foot = _world_bone_head(tgt_arm, "l_foot") or _world_bone_head(tgt_arm, "r_foot")
+        dz = (tgt_foot.z - src_foot.z) if (src_foot and tgt_foot) else ((tgt_pel.z - src_pel.z) if (src_pel and tgt_pel) else 0.0)
+
     src_arm.location = Vector((src_arm.location.x + dx, src_arm.location.y + dy, src_arm.location.z + dz))
     bpy.context.view_layer.update()
     return scale
+
+
+def apply_medial_shoulder_weight_fix(tgt_arm, meshes, src_upper_y_override=None):
+    """Prevent 'double-door fridge' (双开门) raised shoulder caps in arms-down idle pose.
+    Sebastian's l_upperarm/r_upperarm pivots sit at |Y| ~= 10.25 (wide male shoulders), while female/anime
+    characters have shoulders around |Y| ~= 5.8..6.8. Any inner shoulder-cap vertex medial to Sebastian's
+    pivot that is weighted to upperarm swings UPWARD (+Z) when arms lower ~42 deg in idle pose.
+    Smoothly transferring medial upperarm weights (|Y| < tgt_upper_y + margin) to l_shoulder/r_shoulder
+    preserves 100% original narrow shoulder proportions in-game!
+    """
+    if tgt_arm is None or tgt_arm.type != "ARMATURE":
+        return 0, 0
+    b_lu = tgt_arm.data.bones.get("l_upperarm")
+    b_ru = tgt_arm.data.bones.get("r_upperarm")
+    if b_lu is None and b_ru is None:
+        return 0, 0
+
+    tgt_upper_y = abs(b_lu.head_local.y) if b_lu else abs(b_ru.head_local.y)
+    if tgt_upper_y < 1e-3:
+        return 0, 0
+
+    margin = 0.35 * (tgt_upper_y / 10.25)
+    cutoff = tgt_upper_y + margin
+    if src_upper_y_override is not None and 0.25 * tgt_upper_y <= src_upper_y_override <= 0.90 * tgt_upper_y:
+        inner_y = float(src_upper_y_override)
+    else:
+        inner_y = tgt_upper_y * 0.58
+
+    span = max(0.5, cutoff - inner_y)
+    arm_inv = tgt_arm.matrix_world.inverted_safe()
+    fixed_verts = 0
+    fixed_meshes = 0
+
+    for obj in meshes:
+        if obj.type != "MESH" or obj.get("tew1_zero_hide") or len(obj.data.vertices) == 0:
+            continue
+        vg_lu = obj.vertex_groups.get("l_upperarm")
+        vg_ru = obj.vertex_groups.get("r_upperarm")
+        if vg_lu is None and vg_ru is None:
+            continue
+
+        to_arm = np.array(arm_inv @ obj.matrix_world, dtype=np.float64)
+        n = len(obj.data.vertices)
+        co = np.empty(n * 3, dtype=np.float32)
+        obj.data.vertices.foreach_get("co", co)
+        pts = co.reshape(-1, 3).astype(np.float64)
+        arm_y = pts @ to_arm[1, :3] + to_arm[1, 3]
+
+        mesh_touched = False
+        for side, vg_u in (("l", vg_lu), ("r", vg_ru)):
+            if vg_u is None:
+                continue
+            u_idx = vg_u.index
+            sh_name = f"{side}_shoulder"
+            vg_sh = obj.vertex_groups.get(sh_name)
+            updates = []
+            for v in obj.data.vertices:
+                abs_y = abs(float(arm_y[v.index]))
+                if abs_y >= cutoff:
+                    continue
+                # Verify vertex is on the matching side (avoid touching center-line noise beyond 0.5)
+                if side == "l" and arm_y[v.index] < -0.5:
+                    continue
+                if side == "r" and arm_y[v.index] > 0.5:
+                    continue
+                w_u = 0.0
+                for g in v.groups:
+                    if g.group == u_idx:
+                        w_u = float(g.weight)
+                        break
+                if w_u <= 1e-4:
+                    continue
+                t = max(0.0, min(1.0, (abs_y - inner_y) / span))
+                keep_arm = t * t * (3.0 - 2.0 * t)
+                transfer = w_u * (1.0 - keep_arm)
+                if transfer <= 1e-4:
+                    continue
+                updates.append((v.index, w_u - transfer, transfer))
+
+            if updates:
+                if vg_sh is None:
+                    vg_sh = obj.vertex_groups.new(name=sh_name)
+                for vi, new_u, add_sh in updates:
+                    if new_u <= 1e-4:
+                        vg_u.remove([vi])
+                    else:
+                        vg_u.add([vi], new_u, "REPLACE")
+                    vg_sh.add([vi], add_sh, "ADD")
+                fixed_verts += len(updates)
+                mesh_touched = True
+
+        if mesh_touched:
+            fixed_meshes += 1
+
+    return fixed_verts, fixed_meshes
+
+
+def fix_innerwear_clipping(skin_obj, inner_objs, tgt_arm=None, back_offset=0.22, front_offset=0.12, detect_dist=0.35):
+    """Push coplanar/clipping tight innerwear (panties/bra) slightly outward from skin_obj along skin normals
+    and sync exact nearest-skin vertex weights so innerwear moves 100% in lockstep with pelvis/butt/thighs."""
+    from mathutils.kdtree import KDTree
+
+    if skin_obj is None or skin_obj.type != "MESH" or len(skin_obj.data.vertices) == 0:
+        return 0, 0
+
+    ref_inv = tgt_arm.matrix_world.inverted_safe() if (tgt_arm and tgt_arm.type == "ARMATURE") else Matrix.Identity(4)
+    skin_to_ref = np.array(ref_inv @ skin_obj.matrix_world, dtype=np.float64)
+    skin_rot = skin_to_ref[:3, :3]
+    skin_n_mat = np.linalg.inv(skin_rot).T
+
+    sn = len(skin_obj.data.vertices)
+    sco = np.empty(sn * 3, dtype=np.float32)
+    skin_obj.data.vertices.foreach_get("co", sco)
+    s_pts = sco.reshape(-1, 3).astype(np.float64) @ skin_rot.T + skin_to_ref[:3, 3]
+
+    snorm = np.empty(sn * 3, dtype=np.float32)
+    skin_obj.data.vertices.foreach_get("normal", snorm)
+    s_nrm = snorm.reshape(-1, 3).astype(np.float64) @ skin_n_mat.T
+    s_nlen = np.linalg.norm(s_nrm, axis=1, keepdims=True)
+    s_nrm = s_nrm / np.maximum(s_nlen, 1e-8)
+
+    kd = KDTree(sn)
+    for i in range(sn):
+        kd.insert((float(s_pts[i, 0]), float(s_pts[i, 1]), float(s_pts[i, 2])), i)
+    kd.balance()
+
+    skin_vg_names = {vg.index: vg.name for vg in skin_obj.vertex_groups}
+    skin_weights = [
+        [(skin_vg_names[g.group], float(g.weight)) for g in v.groups if g.group in skin_vg_names and g.weight > 1e-5]
+        for v in skin_obj.data.vertices
+    ]
+
+    total_pushed = 0
+    total_synced = 0
+
+    for obj in inner_objs:
+        if obj == skin_obj or obj.type != "MESH" or len(obj.data.vertices) == 0:
+            continue
+        in_to_ref = np.array(ref_inv @ obj.matrix_world, dtype=np.float64)
+        ref_to_in = np.linalg.inv(in_to_ref)
+        in_n = len(obj.data.vertices)
+        ico = np.empty(in_n * 3, dtype=np.float32)
+        obj.data.vertices.foreach_get("co", ico)
+        i_pts = ico.reshape(-1, 3).astype(np.float64) @ in_to_ref[:3, :3].T + in_to_ref[:3, 3]
+
+        # Ensure matching vertex groups exist on innerwear mesh
+        dst_vgs = {vg.name: vg for vg in obj.vertex_groups}
+        modified_pos = False
+        new_ref_pts = i_pts.copy()
+
+        for vi in range(in_n):
+            p = i_pts[vi]
+            _co, si, dist = kd.find((float(p[0]), float(p[1]), float(p[2])))
+            if dist > detect_dist:
+                continue
+            sp = s_pts[si]
+            sn_vec = s_nrm[si]
+            signed = float(np.dot(p - sp, sn_vec))
+            # TEW1 coordinate: +X is forward, -X is back/buttocks (give slightly larger clearance at back)
+            need_clear = back_offset if sn_vec[0] < -0.15 else front_offset
+            if signed < need_clear:
+                new_ref_pts[vi] = p + sn_vec * (need_clear - signed)
+                total_pushed += 1
+                modified_pos = True
+
+            # Sync exact nearest-skin vertex weights so innerwear never clips during pelvic/thigh bend
+            sw = skin_weights[si]
+            if sw:
+                for vg in obj.vertex_groups:
+                    vg.remove([vi])
+                for bname, w in sw:
+                    vg = dst_vgs.get(bname)
+                    if vg is None:
+                        vg = obj.vertex_groups.new(name=bname)
+                        dst_vgs[bname] = vg
+                    vg.add([vi], w, "REPLACE")
+                total_synced += 1
+
+        if modified_pos:
+            out_local = new_ref_pts @ ref_to_in[:3, :3].T + ref_to_in[:3, 3]
+            obj.data.vertices.foreach_set("co", out_local.astype(np.float32).ravel())
+            obj.data.update()
+
+    return total_pushed, total_synced
 
 
 def _align_limb_poses(src_arm, tgt_arm, std_to_main):
@@ -681,6 +916,16 @@ class TEW1RigToolsSettings(bpy.types.PropertyGroup):
         default=True,
         description="自动把源角色手臂与双腿旋转对齐到 TEW1 模板姿势，并通过 LBS 烘焙完整保留所有面部形态键",
     )
+    preserve_original_proportions: BoolProperty(
+        name="保持原版肩宽与脚掌 1:1 比例（防双开门/防大脚）",
+        default=True,
+        description="按真实脚底贴地 Z=0.10 对齐（不拉伸裸足去套塞巴斯蒂安高帮战靴）、用双腿中点对齐前后 X（防腰胯折痕），并保留原版窄肩比例",
+    )
+    fix_medial_shoulder_weights: BoolProperty(
+        name="自动修复「双开门」肩头内侧权重",
+        default=True,
+        description="塞巴斯蒂安上臂旋转轴极宽(|Y|≈10.25)，放臂时内侧肩头会向上顶起成方形「双开门」；开启后自动将内侧上臂权重平滑转移给 l/r_shoulder",
+    )
     migrate_to_tew_rig: BoolProperty(
         name="自动迁移物理发骨并绑定到 TEW1 骨架",
         default=True,
@@ -769,7 +1014,7 @@ class TEW1MmdAToTPose(bpy.types.Operator):
 class TEW1AlignRigTransform(bpy.types.Operator):
     bl_idname = "object.tew1_align_rig_transform"
     bl_label = "仅自动对齐体型缩放与朝向"
-    bl_description = "只对齐源角色骨架与 TEW1 模板骨架的正面朝向、身高比例和脚底高度，不修改骨骼姿势和骨名（方便手动微调）"
+    bl_description = "只对齐源角色骨架与 TEW1 模板骨架的正面朝向、身高比例和真实脚底贴地高度（保持原版肩宽与 1:1 脚掌比例），不修改骨骼姿势和骨名"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -780,15 +1025,69 @@ class TEW1AlignRigTransform(bpy.types.Operator):
             return {"CANCELLED"}
         pid = detect_source_preset(src)[0] if st.source_preset == "AUTO" else st.source_preset
         std_to_main, _ = match_preset_bones(src, pid)
-        scale = _align_armature_transform(src, tgt, std_to_main)
-        self.report({"INFO"}, f"已自动对齐朝向、脚底高度与体型缩放（缩放倍率 {scale:.3f}）。")
+        scale = _align_armature_transform(src, tgt, std_to_main, preserve_proportions=st.preserve_original_proportions)
+        self.report({"INFO"}, f"已自动对齐朝向、脚底贴地与体型缩放（缩放倍率 {scale:.3f}，保持原版肩宽/脚掌比例）。")
+        return {"FINISHED"}
+
+
+class TEW1FixShoulderWeights(bpy.types.Operator):
+    bl_idname = "object.tew1_fix_shoulder_weights"
+    bl_label = "一键修复「双开门」肩宽权重（保持原版窄肩）"
+    bl_description = "将位于塞巴斯蒂安宽肩旋转轴内侧(|Y|<10.6)的 l/r_upperarm 权重平滑转移给 l/r_shoulder，彻底消除放臂待机时的方形宽肩凸起（双开门）"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        from . import active_rig
+        st = getattr(context.scene, "tew1_rig_tools", None)
+        return bool(active_rig(context) or (st and st.target_rig))
+
+    def execute(self, context):
+        from . import active_rig
+        st = context.scene.tew1_rig_tools
+        tgt = active_rig(context) or st.target_rig
+        if tgt is None:
+            self.report({"ERROR"}, "请先选中 TEW1 模板骨架或在面板指定目标骨架。")
+            return {"CANCELLED"}
+        meshes = [o for o in context.selected_objects if o.type == "MESH"]
+        if not meshes:
+            meshes = attached_meshes(tgt)
+        if not meshes:
+            self.report({"ERROR"}, "未找到绑定到 TEW1 骨架的网格。")
+            return {"CANCELLED"}
+        fixed_v, fixed_m = apply_medial_shoulder_weight_fix(tgt, meshes)
+        self.report({"INFO"}, f"防双开门肩宽权重修正完成：平滑转移 {fixed_v} 个肩头内侧顶点（涉及 {fixed_m} 个网格）。")
+        return {"FINISHED"}
+
+
+class TEW1FixInnerwearClipping(bpy.types.Operator):
+    bl_idname = "object.tew1_fix_innerwear_clipping"
+    bl_label = "贴身内衣/内裤防穿模（自动外推 + 同步皮肤权重）"
+    bl_description = "先选中贴身内衣/内裤网格，最后加选身体皮肤网格作为活动对象，一键将贴合/穿模顶点沿皮肤法线微幅外推（后臀 0.22 / 前侧 0.12）并精确同步最近皮肤顶点权重"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        meshes = [o for o in context.selected_objects if o.type == "MESH"]
+        return context.mode == "OBJECT" and len(meshes) >= 2 and context.object in meshes
+
+    def execute(self, context):
+        from . import active_rig
+        skin_obj = context.object
+        inner_objs = [o for o in context.selected_objects if o.type == "MESH" and o != skin_obj]
+        tgt = active_rig(context) or skin_obj.find_armature()
+        pushed, synced = fix_innerwear_clipping(skin_obj, inner_objs, tgt_arm=tgt)
+        self.report(
+            {"INFO"},
+            f"内衣防穿模完成（皮肤基准: {skin_obj.name}）：外推 {pushed} 个穿模/共面顶点，同步 {synced} 个顶点皮肤权重。",
+        )
         return {"FINISHED"}
 
 
 class TEW1OneClickAlignAndBind(bpy.types.Operator):
     bl_idname = "object.tew1_oneclick_align_and_bind"
     bl_label = "一键对骨、重命名并绑定到 TEW1 骨架"
-    bl_description = "全自动换骨一条龙：①识别 MMD/VRChat 预设 ②对齐朝向/身高/脚底 ③肢体姿态对骨并无损保留形态键 ④重命名骨骼并合并辅助权重 ⑤迁移物理发骨并绑定到 TEW1 模板骨架"
+    bl_description = "全自动换骨一条龙：①识别 MMD/VRChat 预设 ②对齐朝向/身高/真实脚底贴地（1:1原比例） ③肢体姿态对骨并无损保留形态键 ④重命名骨骼并合并辅助权重 ⑤防双开门肩头内侧权重修正 ⑥迁移物理发骨并绑定到 TEW1 模板骨架"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -806,8 +1105,16 @@ class TEW1OneClickAlignAndBind(bpy.types.Operator):
             self.report({"ERROR"}, f"按 {pid} 预设仅匹配到 {len(std_to_main)} 根骨骼，请确认源骨架类型。")
             return {"CANCELLED"}
 
-        # Step 1: Align facing, scale, and ground position
-        scale = _align_armature_transform(src, tgt, std_to_main)
+        # Step 1: Align facing, scale, thigh-midpoint X, and true sole-bottom ground Z
+        scale = _align_armature_transform(src, tgt, std_to_main, preserve_proportions=st.preserve_original_proportions)
+
+        # Capture source slender shoulder |Y| in target rig space BEFORE renaming/hiding
+        src_upper_y = None
+        src_lu_w = _world_bone_head(src, std_to_main.get("upperarm_L", ""))
+        src_ru_w = _world_bone_head(src, std_to_main.get("upperarm_R", ""))
+        if src_lu_w and src_ru_w:
+            tgt_inv = tgt.matrix_world.inverted_safe()
+            src_upper_y = 0.5 * (abs((tgt_inv @ src_lu_w).y) + abs((tgt_inv @ src_ru_w).y))
 
         # Step 2: Pose-align limbs & bake into vertices + Shape Keys
         aligned_limbs = 0
@@ -821,8 +1128,8 @@ class TEW1OneClickAlignAndBind(bpy.types.Operator):
 
         # Step 4: Copy physics bones & bind all custom meshes to TEW1 template rig
         copied_phys = 0
+        meshes = attached_meshes(src)
         if st.migrate_to_tew_rig:
-            meshes = attached_meshes(src)
             copied_phys = _copy_physics_bones_to_target(src, tgt, meshes)
             for obj in meshes:
                 wm = obj.matrix_world.copy()
@@ -839,10 +1146,15 @@ class TEW1OneClickAlignAndBind(bpy.types.Operator):
             src.hide_set(True)
             context.view_layer.objects.active = tgt
 
+        # Step 5: Medial shoulder-cap weight transfer (eliminates 'double-door' raised shoulders in arms-down idle!)
+        fixed_sh_verts = 0
+        if st.fix_medial_shoulder_weights and meshes:
+            fixed_sh_verts, _ = apply_medial_shoulder_weight_fix(tgt, meshes, src_upper_y_override=src_upper_y)
+
         self.report(
             {"INFO"},
             f"[{pid}] 一键对骨绑定完成！缩放 {scale:.2f}× | 对齐 {aligned_limbs} 节肢体 | 重命名 {renamed} 骨 | "
-            f"合并 {merged} 辅助权重 | 迁移 {copied_phys} 物理骨 | 绑定 {n_mesh} 个网格",
+            f"合并 {merged} 辅助权重 | 防双开门修正 {fixed_sh_verts} 顶点 | 迁移 {copied_phys} 物理骨 | 绑定 {n_mesh} 个网格",
         )
         return {"FINISHED"}
 
@@ -852,6 +1164,8 @@ CLASSES = (
     TEW1RenameBonesPreset,
     TEW1MmdAToTPose,
     TEW1AlignRigTransform,
+    TEW1FixShoulderWeights,
+    TEW1FixInnerwearClipping,
     TEW1OneClickAlignAndBind,
 )
 

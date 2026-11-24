@@ -137,6 +137,8 @@ class VIEW3D_PT_tew1_rig_tools(bpy.types.Panel):
         box.prop(rt, "source_preset")
 
         opts = box.column(align=True)
+        opts.prop(rt, "preserve_original_proportions")
+        opts.prop(rt, "fix_medial_shoulder_weights")
         opts.prop(rt, "align_limb_pose")
         opts.prop(rt, "merge_aux_weights")
         opts.prop(rt, "migrate_to_tew_rig")
@@ -146,11 +148,14 @@ class VIEW3D_PT_tew1_rig_tools(bpy.types.Panel):
         main.operator("object.tew1_oneclick_align_and_bind", text="一键对骨、重命名并绑定到 TEW1 骨架", icon="CHECKMARK")
 
         sub = layout.box()
-        sub.label(text="分步微调工具（可选）", icon="TOOL_SETTINGS")
+        sub.label(text="防双开门 / 防穿模 / 分步微调工具", icon="TOOL_SETTINGS")
         col = sub.column(align=True)
+        col.operator("object.tew1_fix_shoulder_weights", text="一键修复「双开门」肩宽权重（保持窄肩）", icon="MOD_ARMATURE")
+        col.operator("object.tew1_fix_innerwear_clipping", text="贴身内衣/内裤防穿模（先选内衣再选皮肤）", icon="MOD_SHRINKWRAP")
+        col.separator(factor=0.4)
         col.operator("object.tew1_mmd_a_to_tpose", text="MMD A-Pose 一键转 T-Pose（保留形态键）", icon="OUTLINER_OB_ARMATURE")
         col.operator("object.tew1_rename_bones_preset", text="仅执行一键骨骼重命名 + 合并辅助权重", icon="BONE_DATA")
-        col.operator("object.tew1_align_rig_transform", text="仅自动对齐体型缩放与朝向", icon="ORIENTATION_GLOBAL")
+        col.operator("object.tew1_align_rig_transform", text="仅自动对齐体型缩放与朝向（脚掌1:1）", icon="ORIENTATION_GLOBAL")
 
         disp = layout.row(align=True)
         op1 = disp.operator("object.tew1_toggle_rig_display", text="透视骨架", icon="ARMATURE_DATA")
@@ -458,7 +463,7 @@ class VIEW3D_PT_tew1_phys_preview(bpy.types.Panel):
             row.operator("object.tew1_restore_hair_action", text="恢复原动作", icon="LOOP_BACK")
 
         em_box = layout.box()
-        em_box.label(text="游戏内三档角色自发光 (F7 / F8 / F9)", icon="LIGHT")
+        em_box.label(text="局内自定义菜单（默认 ` 键）& 自发光 (F7/F8/F9)", icon="LIGHT")
         em_box.prop(state, "auto_include_emissive")
         obj = context.object
         if obj and obj.type == "MESH":

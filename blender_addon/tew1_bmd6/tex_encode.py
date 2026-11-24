@@ -237,6 +237,11 @@ def _sanitize_slug(text, fallback):
 
 def _guess_preset(mat, rgba):
     name = mat.name.lower()
+    # Tight innerwear/panties/bra MUST stay opaque BC1 so transparent-padding pixels never turn innerwear sheer!
+    if any(k in name for k in ("panty", "panties", "underwear", "innerwear", "inner_wear", "bra", "lingerie", "briefs", "内裤", "内衣", "胖次", "胸罩")):
+        return "OPAQUE"
+    if any(k in name for k in ("sheer", "gauze", "chiffon", "pajama_outer", "outer_sheer", "透纱", "薄纱", "半透外套", "睡衣外套")):
+        return "SHEER_OUTER"
     if any(k in name for k in ("lash", "eyelash", "lace", "alpha", "trans", "cutout", "睫毛", "蕾丝", "透明")):
         return "CUTOUT"
     if rgba is not None and int((rgba[:, :, 3] < 240).sum()) > max(64, rgba.shape[0] * rgba.shape[1] // 200):
@@ -301,6 +306,7 @@ class TEW1BatchConvertMaterials(bpy.types.Operator):
                 build.put(root, f"generated/textures/{color}.bimage", albedo)
                 build.put(root, f"generated/decls/material/{key}.decl", decl)
                 mat["tew1_material_path"] = key
+                mat["tew1_sheer_outer"] = (preset == "SHEER_OUTER")
                 converted[mat] = (key, preset)
                 idx += 1
             except Exception as err:

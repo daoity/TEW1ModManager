@@ -109,6 +109,18 @@ def validate_rig_for_export(rig):
     if total_surfs > MAX_SAFE_SURFACES:
         errors.append(f"导出总表面数为 {total_surfs}，超过安全上限 {MAX_SAFE_SURFACES}（游戏可能闪烁或崩溃）。")
 
+    asset_name = str(rig.get("tew1_overlay_asset", "")).lower()
+    if "pl0007" in asset_name:
+        live_pl0007 = [o for o in rig.children if o.type == "MESH" and SLOT in o and not o.get(ZERO_HIDE)]
+        if live_pl0007:
+            warnings.append("当前模板为 pl0007（全裸/特殊占位模型），建议将所有表面设为「安全清零隐藏」，否则脚底可能出现折叠废网格。")
+
+    head_bone = rig.data.bones.get("head")
+    neck_z = float(head_bone.head_local.z) if head_bone else None
+    lu_bone = rig.data.bones.get("l_upperarm")
+    tgt_upper_y = abs(float(lu_bone.head_local.y)) if lu_bone else None
+    arm_inv = rig.matrix_world.inverted_safe()
+
     used_slots = {}
     bound_meshes = []
     for obj in rig.children:
@@ -167,14 +179,44 @@ def validate_rig_for_export(rig):
         if not mat_path:
             warnings.append(f"网格 {obj.name} 第一个材质未设置 tew1_material_path（将沿用原版材质路径）。")
 
-        # Check vertex weights coverage on native skeleton
+        # Check vertex weights coverage on native skeleton + head-skin split + medial shoulder-cap check
         vg_names = {vg.index: vg.name for vg in obj.vertex_groups}
         unweighted = 0
+        medial_upperarm_verts = 0
+        to_arm = np.array(arm_inv @ obj.matrix_world, dtype=np.float64)
+        n_v = len(mesh.vertices)
+        v_co = np.empty(n_v * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", v_co)
+        v_arm = v_co.reshape(-1, 3).astype(np.float64) @ to_arm[:3, :3].T + to_arm[:3, 3]
+        lu_vg = obj.vertex_groups.get("l_upperarm")
+        ru_vg = obj.vertex_groups.get("r_upperarm")
+        lu_i = lu_vg.index if lu_vg else -1
+        ru_i = ru_vg.index if ru_vg else -1
         for v in mesh.vertices:
-            if not any(vg_names.get(g.group) in skel_names and g.weight > 1e-6 for g in v.groups):
+            has_nat = False
+            for g in v.groups:
+                if vg_names.get(g.group) in skel_names and g.weight > 1e-6:
+                    has_nat = True
+                if tgt_upper_y and tgt_upper_y > 4.0 and g.group in (lu_i, ru_i) and g.weight > 0.35:
+                    if abs(float(v_arm[v.index, 1])) < tgt_upper_y * 0.82:
+                        medial_upperarm_verts += 1
+            if not has_nat:
                 unweighted += 1
         if unweighted > 0:
             errors.append(f"网格 {obj.name} 有 {unweighted} 个顶点未绑定到 TEW1 原生骨骼。")
+        if medial_upperarm_verts >= 12:
+            warnings.append(
+                f"网格 {obj.name} 有 {medial_upperarm_verts} 个肩头内侧顶点(|Y|<{tgt_upper_y*0.82:.1f})绑定了较重 upperarm 权重，"
+                f"待机垂臂时可能呈方形「双开门」；建议在「TEW Mesh > 2」点「一键修复双开门肩宽权重」。"
+            )
+        # Check body slot leaking head/ear skin vertices above neck
+        if neck_z is not None and surf_name not in HEAD_ONLY_SLOTS and n_v > 0:
+            above_head = int((v_arm[:, 2] > neck_z + 2.5).sum())
+            if above_head >= 20 and not looks_head:
+                warnings.append(
+                    f"身体槽网格 {obj.name} ({surf_name}) 有 {above_head} 个顶点伸入头部区域(Z>{neck_z+2.5:.1f})，"
+                    f"若含耳部/上颈/后脑皮肤请分离并移入 m_face（及断头模型 pl0001_ng），否则断头时头部会残留多出网格。"
+                )
 
     summary = f"总表面 {total_surfs}/{MAX_SAFE_SURFACES} · 已绑定网格 {len(bound_meshes)} · 错误 {len(errors)} · 警告 {len(warnings)}"
     return errors, warnings, summary

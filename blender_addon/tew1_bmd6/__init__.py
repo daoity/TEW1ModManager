@@ -2,10 +2,10 @@
 bl_info = {
     "name": "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)",
     "author": "TEW1 Mod Tools",
-    "version": (2, 5, 0),
+    "version": (2, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (TEW Mesh / TEW Physical) & File > Import / Export",
-    "description": "兼容 Blender 4.0–5.2+：恶灵附身 1 BMD6 导入导出、MMD/VRChat 一键对骨重命名、免转DDS一键材质、断肢拆分、TEW Physical 实时物理/碰撞体、TEW Facial 物理表情与 CG 嘴骨权重生成。",
+    "description": "兼容 Blender 4.0–5.2+：恶灵附身 1 BMD6 导入导出、MMD/VRChat 一键对骨（防双开门窄肩修正+脚掌1:1贴地+贴身内衣防穿模）、免转DDS一键材质（支持透纱外套）、断肢拆分、TEW Physical 实时物理与 TEW Facial 表情。",
     "category": "Import-Export",
 }
 
@@ -322,6 +322,14 @@ def export_model(filename, rig, continuous):
     for slot, obj in selected.items():
         surfaces[slot] = export_surface(obj, rig, surfaces[slot], model.skeleton, continuous)
     if appends:
+        # Place sheer outerwear surfaces last so body/legs/innerwear always render before semi-transparent cloth
+        def _is_sheer(pair):
+            _aname, o = pair
+            if o.data.materials and o.data.materials[0] is not None:
+                return bool(o.data.materials[0].get("tew1_sheer_outer", False))
+            return False
+
+        appends.sort(key=lambda pair: (1 if _is_sheer(pair) else 0))
         template_surf = next((s for s in model.surfaces if s.name == "m_face"), model.surfaces[0])
         for aname, obj in appends:
             seed = replace(template_surf, name=aname)

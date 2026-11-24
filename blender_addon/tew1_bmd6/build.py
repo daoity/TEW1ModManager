@@ -173,15 +173,34 @@ def segment_fit(a, b, target_a, target_b, across_a, across_b):
     return transform, target_a - transform @ a, rotation
 
 
-def coordinates(pmx, joints, scale, shoulder_fit, weights):
+def coordinates(pmx, joints, scale, shoulder_fit, weights, preserve_foot_1to1=True):
     source = np.array([vertex.co for vertex in pmx.vertices])
     bone_points = np.array([bone.location for bone in pmx.bones]) @ AXES * scale
     z_shift = -float(source[:, 1].min()) * scale + 0.10
-    offset = np.array([0, 0, z_shift])
+    # Align global X to thigh-midpoint X (prevents anterior-posterior hip/waist kink)
+    src_hip_x = 0.5 * (bone_points[259][0] + bone_points[265][0])
+    tgt_hip_x = 0.5 * (joints['l_thigh'][0] + joints['r_thigh'][0])
+    offset = np.array([tgt_hip_x - src_hip_x, 0.0, z_shift])
     points = source @ AXES * scale + offset
     bone_points += offset
     transform = {}
     identity = (np.eye(3), np.zeros(3), np.eye(3))
+
+    # C1-smooth shared-joint spine_02 -> spine_01 -> pelvis -> thigh chain
+    hip_z_fit = 0.46
+    src_sp2, src_sp1, src_pel = bone_points[13], bone_points[12], bone_points[4]
+    src_hip_mid = 0.5 * (bone_points[259] + bone_points[265])
+    tgt_hip_mid = 0.5 * (joints['l_thigh'] + joints['r_thigh'])
+    new_hip_mid_z = src_hip_mid[2] + (tgt_hip_mid[2] - src_hip_mid[2]) * hip_z_fit
+    new_pel = np.array([src_pel[0], src_pel[1], src_pel[2] + (new_hip_mid_z - src_hip_mid[2]) * 0.55])
+    new_sp1 = np.array([src_sp1[0], src_sp1[1], src_sp1[2] + (new_hip_mid_z - src_hip_mid[2]) * 0.25])
+    spine_across = np.array([0.0, 1.0, 0.0])
+    if np.linalg.norm(src_sp1 - src_sp2) > 1e-4:
+        transform['spine_01'] = segment_fit(src_sp2, src_sp1, src_sp2, new_sp1, spine_across, spine_across)
+    if np.linalg.norm(src_hip_mid - src_sp1) > 1e-4:
+        new_hip_mid = np.array([tgt_hip_mid[0], src_hip_mid[1], new_hip_mid_z])
+        transform['pelvis'] = segment_fit(src_sp1, src_hip_mid, new_sp1, new_hip_mid, spine_across, spine_across)
+
     for side, slots, first_finger in (('l', (15, 16, 18, 19), 20), ('r', (44, 45, 47, 48), 50)):
         wrist = f'{side}_hand'
         target_wrist = joints[wrist]
@@ -193,9 +212,25 @@ def coordinates(pmx, joints, scale, shoulder_fit, weights):
         translation = target_wrist - rotation @ source_wrist
         transform[wrist] = (rotation, translation, rotation)
         shoulder, arm, elbow = bone_points[list(slots[:3])]
-        new_shoulder = shoulder + (joints[f'{side}_shoulder'] - shoulder) * shoulder_fit * 0.5
-        new_arm = arm + (joints[f'{side}_upperarm'] - arm) * shoulder_fit
-        new_elbow = elbow + (joints[f'{side}_forearm'] - elbow) * 0.74
+        # Preserve original slender shoulder width when shoulder_fit == 0.0 (anti-"double-door")
+        t_sh = joints[f'{side}_shoulder']
+        t_arm = joints[f'{side}_upperarm']
+        t_elb = joints[f'{side}_forearm']
+        new_shoulder = np.array([
+            shoulder[0] + (t_sh[0] - shoulder[0]) * shoulder_fit * 0.5,
+            shoulder[1] + (t_sh[1] - shoulder[1]) * shoulder_fit * 0.5,
+            shoulder[2] + (t_sh[2] - shoulder[2]) * max(0.10, shoulder_fit * 0.5),
+        ])
+        new_arm = np.array([
+            arm[0] + (t_arm[0] - arm[0]) * shoulder_fit,
+            arm[1] + (t_arm[1] - arm[1]) * shoulder_fit,
+            arm[2] + (t_arm[2] - arm[2]) * max(0.20, shoulder_fit),
+        ])
+        new_elbow = np.array([
+            elbow[0] + (t_elb[0] - elbow[0]) * (0.50 if shoulder_fit <= 0.01 else 0.74),
+            elbow[1] + (t_elb[1] - elbow[1]) * (0.35 if shoulder_fit <= 0.01 else 0.74),
+            elbow[2] + (t_elb[2] - elbow[2]) * (0.50 if shoulder_fit <= 0.01 else 0.74),
+        ])
         # All adjacent sections share the same fitted joint center. The forearm
         # turns toward the wrist frame so the hand can rotate without a seam.
         transform[f'{side}_shoulder'] = (identity[0], new_shoulder - shoulder, identity[2])
@@ -225,12 +260,23 @@ def coordinates(pmx, joints, scale, shoulder_fit, weights):
         target_ankle = joints[f'{side}_foot']
         target_toe = joints[f'{side}_toe']
         across = np.array([0.0, 1.0, 0.0])
-        transform[f'{side}_thigh'] = segment_fit(thigh, knee, target_thigh, target_knee, across, across)
-        transform[f'{side}_shin'] = segment_fit(knee, ankle, target_knee, target_ankle, across, across)
-        foot_length = (target_toe[0] - target_ankle[0]) / (toe[0] - ankle[0])
-        shoe_height = (target_ankle[2] - 0.10) / (ankle[2] - 0.10)
-        foot = np.diag((foot_length, 1.0, shoe_height))
-        transform[f'{side}_foot'] = (foot, target_ankle - foot @ ankle, np.linalg.inv(foot).T)
+        # Share pelvis bottom Z smoothly with thigh top
+        new_thigh = np.array([target_thigh[0], thigh[1] + (target_thigh[1] - thigh[1]) * 0.45, new_hip_mid_z])
+        new_knee = np.array([target_knee[0], knee[1] + (target_knee[1] - knee[1]) * 0.50, target_knee[2]])
+        if preserve_foot_1to1:
+            # 100% original 1:1 bare-foot proportions (no 1.45x length / 1.60x boot-height stretch!)
+            new_ankle = np.array([target_ankle[0], ankle[1] + (target_ankle[1] - ankle[1]) * 0.50, ankle[2]])
+            transform[f'{side}_thigh'] = segment_fit(thigh, knee, new_thigh, new_knee, across, across)
+            transform[f'{side}_shin'] = segment_fit(knee, ankle, new_knee, new_ankle, across, across)
+            transform[f'{side}_foot'] = (np.eye(3), new_ankle - ankle, np.eye(3))
+            transform[f'{side}_toe'] = (np.eye(3), new_ankle - ankle, np.eye(3))
+        else:
+            transform[f'{side}_thigh'] = segment_fit(thigh, knee, target_thigh, target_knee, across, across)
+            transform[f'{side}_shin'] = segment_fit(knee, ankle, target_knee, target_ankle, across, across)
+            foot_length = (target_toe[0] - target_ankle[0]) / (toe[0] - ankle[0])
+            shoe_height = (target_ankle[2] - 0.10) / (ankle[2] - 0.10)
+            foot = np.diag((foot_length, 1.0, shoe_height))
+            transform[f'{side}_foot'] = (foot, target_ankle - foot @ ankle, np.linalg.inv(foot).T)
     normals = np.array([vertex.normal for vertex in pmx.vertices]) @ AXES
     for index, assignments in enumerate(weights):
         if all(name not in transform for name, _ in assignments):
@@ -395,10 +441,13 @@ def bimage(image, template, alpha=False):
     return bytes(header) + b''.join(parts)
 
 
-def material(index, has_alpha, texture=None):
+def material(index, has_alpha, texture=None, clip_threshold=None):
     if texture is None:
         texture = f'{MATERIAL_ROOT}/base_{index:02}'
     flat = 'textures/character_global_ng/n_flat'
+    if clip_threshold is None:
+        # index 9 (SHEER_OUTER) uses low clipthreshold 0.05 so semi-transparent fabrics survive alpha-test
+        clip_threshold = '0.05' if (not has_alpha or index == 9) else '0.33'
     # TEW's deferred character program pulls from virtual texture pages. This
     # native forward program requests ordinary BImages and supports skinned meshes.
     values = {
@@ -406,7 +455,7 @@ def material(index, has_alpha, texture=None):
         'stageprogram': 'lppalbedoalphaforwardanisotropic',
         'velocityprogram': 'velocityhair', 'depthfillonlyprogram': 'occluderhairdepthonlyblend',
         'transmap': texture, 'sparebumpmap': flat, 'sparespecularmap': 'textures/character_global_ng/white',
-        'clipthreshold': '0.33' if has_alpha else '0.05', 'newspecularscale': '0.065' if index == 1 else '0.05',
+        'clipthreshold': str(clip_threshold), 'newspecularscale': '0.065' if index == 1 else '0.05',
         'powergloss': '22.0', 'specularfresnel': '0.09', 'fresnel_reflection': '0.065',
         'fresnel_reflection_curve': '0.4', 'envmapstrength': '1.16',
         'envmapambientstrength': '1.06',
@@ -564,7 +613,8 @@ def main(argv):
     parser.add_argument('--reader', type=Path, default=PMX_READER)
     parser.add_argument('--overlay', type=Path, default=PROJECT / 'Haruka-overlay')
     parser.add_argument('--scale', type=float, default=5.15)
-    parser.add_argument('--shoulder-fit', type=float, default=0.24)
+    parser.add_argument('--shoulder-fit', type=float, default=0.0,
+                        help='0.0 preserves original slender shoulder width (anti-"double-door")')
     parser.add_argument('--texture-size', type=int, choices=(512, 1024, 2048), default=1024)
     parser.add_argument('--custom-bone', action='store_true')
     parser.add_argument('--expressions', action='store_true')

@@ -46,11 +46,12 @@ class TEW1Workspace(bpy.types.PropertyGroup):
     preset: EnumProperty(
         name="着色预设",
         items=[
-            ("OPAQUE", "衣服和皮肤 (OPAQUE)", "不透明漫反射前向着色（BC1/DXT1），适用于皮肤、衣服、金属等常规材质"),
-            ("HAIR",   "不透明发片 (HAIR)",   "前向发片着色（BC1/DXT1），适用于常规实体头发"),
-            ("CUTOUT", "透明裁切 (CUTOUT)",   "带 Alpha 裁切前向着色（BC3/DXT5），适用于睫毛、蕾丝、透明发梢等镂空材质"),
+            ("OPAQUE",      "衣服/皮肤/内衣 (OPAQUE BC1)", "不透明漫反射前向着色（BC1/DXT1），适用于皮肤、常规衣服、内裤/内衣等绝对不透明材质"),
+            ("HAIR",        "不透明发片 (HAIR BC1)",       "前向发片着色（BC1/DXT1），适用于常规实体头发"),
+            ("CUTOUT",      "睫毛/镂空裁切 (CUTOUT BC3)",  "带 Alpha 裁切前向着色（BC3/DXT5，clipthreshold=0.33），适用于睫毛、蕾丝、透明发梢"),
+            ("SHEER_OUTER", "透纱外套 (SHEER BC3 0.05)",   "半透明透纱外套专用（BC3/DXT5，clipthreshold=0.05，双面渲染；兼容游戏内透纱档位切换，切勿给内裤用）"),
         ],
-        description="选择 TEW1 前向着色器类型（自动绕过原版 Megatexture，兼容游戏光照与 F7/F8/F9 自发光）",
+        description="选择 TEW1 前向着色器类型（自动绕过原版 Megatexture，兼容游戏光照与局内自发光/透纱切换）",
     )
     toolkit_folder: StringProperty(
         name="外部 ModToolkit 预设目录",
@@ -104,6 +105,7 @@ class TEW1WriteMaterial(bpy.types.Operator):
                     raise ValueError("底色贴图路径为空，且当前材质节点中未找到图片节点，请指定 PNG/TGA/JPG/DDS 文件。")
             key = export_material_any_source(loose_root(settings.overlay), settings.key, source, settings.preset)
             mat["tew1_material_path"] = key
+            mat["tew1_sheer_outer"] = (settings.preset == "SHEER_OUTER")
         except (OSError, ValueError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
