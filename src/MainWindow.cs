@@ -49,6 +49,7 @@ namespace TEW1
         private TextBlock gameBadgeText;
         private Button detectGameBtn;
         private Button chooseGameBtn;
+        private Button extractModelsBtn;
 
         private TextBlock countBadgeText;
         private Button refreshBtn;
@@ -448,10 +449,21 @@ namespace TEW1
             {
                 Style = (Style)FindResource("SecondaryButton"),
                 Content = "选择目录",
+                Margin = new Thickness(0, 0, 6, 0),
                 Padding = new Thickness(13, 6, 13, 6)
             };
             chooseGameBtn.Click += delegate { ChooseGameDirectory(); };
             btnRow.Children.Add(chooseGameBtn);
+
+            extractModelsBtn = new Button
+            {
+                Style = (Style)FindResource("GhostButton"),
+                Content = "提取原版模型",
+                Padding = new Thickness(10, 6, 10, 6),
+                ToolTip = "从游戏 base/*.tangoresource 解包提取原版 .bmd6model 文件（pl0000_ng 等），供 Blender 导入制作 Mod"
+            };
+            extractModelsBtn.Click += delegate { ExtractVanillaModels(); };
+            btnRow.Children.Add(extractModelsBtn);
 
             Grid.SetColumn(btnRow, 3);
             grid.Children.Add(btnRow);
@@ -2046,6 +2058,7 @@ namespace TEW1
 
             detectGameBtn.IsEnabled = !isBusy;
             chooseGameBtn.IsEnabled = !isBusy;
+            if (extractModelsBtn != null) extractModelsBtn.IsEnabled = !isBusy && hasValidGame;
             importZipBtn.IsEnabled = !isBusy;
             linkFolderBtn.IsEnabled = !isBusy;
             refreshBtn.IsEnabled = !isBusy;
@@ -2137,6 +2150,46 @@ namespace TEW1
                 ModernDialog.Show(this, "未检测到游戏目录",
                     "未在常见 Steam/本地目录中找到 EvilWithin.exe。\n请点击「选择目录」手动定位游戏安装文件夹。",
                     DialogKind.Info, "我知道了");
+            }
+        }
+
+        private async void ExtractVanillaModels()
+        {
+            if (isBusy) return;
+            if (String.IsNullOrWhiteSpace(library.Game))
+            {
+                ChooseGameDirectory();
+                if (String.IsNullOrWhiteSpace(library.Game)) return;
+            }
+
+            ExtractScope? scope = TangoExtractor.PromptExtractScope(this);
+            if (!scope.HasValue) return;
+
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            string selected = FolderPicker.PickFolder(GetHwnd(), "选择原版 .bmd6model 保存文件夹（严禁选游戏目录内）", desktop);
+            if (String.IsNullOrWhiteSpace(selected)) return;
+
+            string gameDir = library.Game;
+            string outDir = System.IO.Path.Combine(selected, "TEW1_原版模型");
+            SetBusy(true, "正在扫描 .tangoresource 并提取原版模型…");
+            try
+            {
+                ExtractResult res = await Task.Run(() => TangoExtractor.ExtractModels(gameDir, outDir, scope.Value));
+                SetStatus(String.Format("提取完成！共导出 {0} 个 .bmd6model 到 {1}", res.WrittenCount, res.OutputDir), "#2EC476");
+                try { Process.Start("explorer.exe", "\"" + res.OutputDir + "\""); }
+                catch { }
+                ModernDialog.Show(this, "原版模型提取完成",
+                    String.Format("已从 {0} 个游戏档案中成功提取 {1} 个 .bmd6model 模型文件。\n\n输出目录：\n{2}\n\n现在打开 Blender 的「TEW Mesh → 导入 BMD6」即可选择 pl0000_ng.bmd6model！",
+                        res.ArchivesScanned, res.WrittenCount, res.OutputDir),
+                    DialogKind.Info, "打开完成");
+            }
+            catch (Exception ex)
+            {
+                ShowError("提取原版模型失败", ex.Message);
+            }
+            finally
+            {
+                SetBusy(false, null);
             }
         }
 
