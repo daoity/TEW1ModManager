@@ -1,9 +1,10 @@
 # 《恶灵附身 1》（The Evil Within 1）一体化 Mod 管理器 & Blender 插件套件
 
 一套专为 PC 版《恶灵附身 1》（`EvilWithin.exe` x64）打造的**零侵入外挂 Mod 工具链**，涵盖：
-- **便携单文件 Mod 管理器 & 原生内存加载器**（`TEW1ModManager.exe`）
+- **便携单文件 Mod 管理器 & 原生内存加载器 + 内置 `.tangoresource` 原版模型提取器**（`TEW1ModManager.exe`）
 - **通用 D3D11 动态物理 / 表情 / 透纱 / 自发光运行时**（`tew1_dyn_runtime.dll` v3.10）
-- **Blender 4.0 — 5.2+ LTS 创作插件**（`TEW Mesh` + `TEW Physical` + `TEW Facial` v2.6）
+- **Blender 4.0 — 5.2+ LTS 创作插件**（`TEW Mesh` + `TEW Physical` + `TEW Facial` v2.7，自带游戏模型一键提取导入）
+- **独立零依赖游戏资源提取工具**（`tools/TEW1_TangoResource_Extractor.py`，双击 GUI / 命令行提取 `.bmd6model`/`.bimage`/`.decl`/`.wav`）
 - **傻瓜化中文图文全流程教程**（[TEW1_Mod制作与物理全流程教程.md](TEW1_Mod制作与物理全流程教程.md)）
 - **AI Agent Skill 工作流沉淀**（[skills/tew1-mod-production/SKILL.md](skills/tew1-mod-production/SKILL.md)）
 
@@ -17,14 +18,15 @@
 - **绿色便携单文件**：无外部运行库依赖，Mod 与配置保存在同级 `Data/` 目录。
 - **模型单选 + 功能性 Mod 独立叠加**：左侧单选角色模型，同时独立勾选/关闭语音包、补丁等功能性 Mod，启动游戏自动叠加合并。
 - **动态物理、表情与透纱运行时（v3.10）**：内置 `tew1_dyn_runtime.dll` v3.10，支持 `tew1_dyn.bin (v1/v2)` 实时头发/胸/衣摆物理、5 槽位胶囊碰撞体、自然眨眼与受击/死亡表情、4 档双面透纱外套切换，并通过 COM 生命周期钉住 + 120 帧自动 GC 彻底根治跨章节（如 Ch1→Ch2）闪退。
+- **一键提取游戏原版 `.bmd6model` 模型**：顶部栏点击 **`提取原版模型`**，可直接从游戏 `base/*.tangoresource` 解包主角全章节 27 模、全部人物(`pl*`)、全部怪物(`em*`)或全游戏 `.bmd6model` 供 Blender 导入，不再发愁找不到可导入的模型文件。
 - **游戏内实用热键**：
   - **`` ` ``（Tab 上方反引号/波浪键，默认）**：开关局内服装差分 / 4 档透纱外套 / 自发光悬浮面板（不与原版管理器 `Insert` 冲突；面板按 `[9]` 可实时改键并自动保存到 `tew1_dyn_hotkey.ini`）。
   - `F7` / `F8` / `F9`：切换三档角色自发光（柔和 / 明亮二次元 / 全亮无阴影，再按关闭；严格隔离深度通道不发黑）。
   - `F10`：游戏内即时调试受击表情（`Shift+F10` 定格受击，`Ctrl+F10` 定格死亡）。
 
-### 2. Blender 4.0–5.2+ 插件 (`blender_addon/tew1_bmd6` v2.6)
+### 2. Blender 4.0–5.2+ 插件 (`blender_addon/tew1_bmd6` v2.7)
 - **`TEW Mesh` 面板**：
-  - **导入导出 `.bmd6model`**：保留原生骨架模板与断肢信息，自动将透纱外套追加槽排到最末绘制。
+  - **内置原版 `.tangoresource` 提取 + BMD6 导入导出**：自带 **`一键从游戏提取并导入主模板 (pl0000_ng)`** 与 **`批量提取原版 .bmd6model 模型库...`**，装好插件即可 1 秒开始建模；导出保留原生骨架模板与断肢信息，自动将透纱外套追加槽排到最末绘制。
   - **内置 MMD / VRChat 一键对骨重命名（防双开门 + 脚掌 1:1 + 防内衣穿模）**：自动对齐朝向、身高缩放与**真实脚底贴地 `Z=0.10`（1:1 裸足不拉长）**、双大腿中点 X 对齐防腰胯折痕、无损 LBS 烘焙保留全部面部形态键、**自动修复“双开门”肩头内侧权重**、**贴身内衣/内裤一键外推防穿模并同步皮肤权重**，并迁移物理发骨到 TEW1 模板骨架下。
   - **一键免转 DDS 材质生成**：内置 NumPy BC1/DXT1 & BC3/DXT5 编码器，自动区分不透明内裤/皮肤（`OPAQUE` BC1）、实体头发（`HAIR`）、镂空（`CUTOUT`）与**透纱外套（`SHEER_OUTER` BC3 `clipthreshold 0.05`）**，绕过原版 Megatexture。
   - **断肢安全工具**：一键按骨骼权重拆分身体 4 部位（躯干/左臂/右臂/双腿），原版 `m_hair` 与 `pl0007` 安全清零隐藏防崩溃，导出前自动体检（`<= 31` 表面、安全头部槽位、头身分离与双开门预警）。
@@ -42,7 +44,8 @@
 TEW1ModManager/
 ├── src/                               # Mod 管理器 & 原生加载器 C# 源码 (WPF / Win32)
 ├── runtime_src/                       # D3D11 动态物理/表情/透纱/自发光运行时 C++ 源码及配套脚本
-├── blender_addon/tew1_bmd6/           # Blender 4.0-5.2+ 插件源码 (TEW Mesh / TEW Physical)
+├── blender_addon/tew1_bmd6/           # Blender 4.0-5.2+ 插件源码 (TEW Mesh / TEW Physical + 内置模型提取)
+├── tools/                             # 独立零依赖 .tangoresource 原版模型与资源提取工具
 ├── skills/tew1-mod-production/        # Antigravity AI Skill (完整逆向规范与自动化工作流)
 ├── TEW1_Mod制作与物理全流程教程.md     # 面向手动作者的完整图文教程
 ├── build.ps1                          # 管理器一键构建脚本 (.NET Framework 4)
@@ -59,7 +62,7 @@ TEW1ModManager/
 2. 双击运行，自动识别 `EvilWithin.exe` 路径，拖入 Mod `.zip` 后勾选启动即可。
 
 ### Mod 作者（Blender 4.0–5.2+）
-1. 从 **Releases** 下载 `恶灵附身1_BMD6_Blender插件_v2.6_TEW_Physical_Blender4-5.zip`（或 ASCII 发布名 `TEW1_BMD6_Blender_Plugin_v2.6_TEW_Physical_Blender4-5.zip`）。
+1. 从 **Releases** 下载 `TEW1_BMD6_Blender_Plugin_v2.7_TEW_Physical_Blender4-5.zip`（如需要也可下载独立提取器 `TEW1_TangoResource_Extractor.py`）。
 2. 在 Blender 4.2+ 直接将 ZIP 拖入窗口安装（或 `编辑 > 偏好设置 > 插件 > 从磁盘安装`）。
 3. 按 **`N`** 键展开 **`TEW Mesh`** 与 **`TEW Physical`** 面板，详细步骤请阅读：[TEW1_Mod制作与物理全流程教程.md](TEW1_Mod制作与物理全流程教程.md)。
 

@@ -146,6 +146,7 @@ $sources = @(
     (Join-Path $srcDir 'FolderPicker.cs'),
     (Join-Path $srcDir 'AppTheme.cs'),
     (Join-Path $srcDir 'Dialogs.cs'),
+    (Join-Path $srcDir 'TangoExtractor.cs'),
     (Join-Path $srcDir 'MainWindow.cs'),
     (Join-Path $srcDir 'Program.cs')
 )
