@@ -2,10 +2,10 @@
 bl_info = {
     "name": "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)",
     "author": "TEW1 Mod Tools",
-    "version": (2, 7, 0),
+    "version": (2, 8, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (TEW Mesh / TEW Physical) & File > Import / Export",
-    "description": "兼容 Blender 4.0–5.2+：内置原版游戏 .tangoresource 一键提取与导入、BMD6 读写、MMD/VRChat 一键对骨（防双开门窄肩+脚掌1:1+内衣防穿模）、免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情。",
+    "description": "兼容 Blender 4.0–5.2+：内置原版模型提取、自动回收隐藏废槽(彻底解决pl0000_ng超31槽报错)、MMD/VRChat 一键对骨（防双开门窄肩+脚掌1:1+内衣防穿模）、按贴图去重免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情。",
     "category": "Import-Export",
 }
 
@@ -302,6 +302,7 @@ def active_rig(context):
 
 
 def export_model(filename, rig, continuous):
+    from .dismember import is_havok_surface
     raw = template_bytes(rig)
     model = bmd6.read_model(raw)
     surfaces = list(model.surfaces)
@@ -322,20 +323,54 @@ def export_model(filename, rig, continuous):
     for slot, obj in selected.items():
         surfaces[slot] = export_surface(obj, rig, surfaces[slot], model.skeleton, continuous)
     if appends:
-        # Place sheer outerwear surfaces last so body/legs/innerwear always render before semi-transparent cloth
+        # Recycle zero-hidden non-Havok stock slots first so pl0000_ng (31 stock slots) never overflows 31!
+        # Keep Havok surfaces (m_hair / *__clt*) strictly untouched at their original slot index.
+        recyclable = [
+            slot for slot in range(len(model.surfaces))
+            if slot in selected
+            and selected[slot].get("tew1_zero_hide")
+            and not is_havok_surface(model.surfaces[slot].name)
+        ]
+
         def _is_sheer(pair):
             _aname, o = pair
             if o.data.materials and o.data.materials[0] is not None:
                 return bool(o.data.materials[0].get("tew1_sheer_outer", False))
             return False
 
-        appends.sort(key=lambda pair: (1 if _is_sheer(pair) else 0))
+        normal_appends = [p for p in appends if not _is_sheer(p)]
+        sheer_appends = [p for p in appends if _is_sheer(p)]
         template_surf = next((s for s in model.surfaces if s.name == "m_face"), model.surfaces[0])
-        for aname, obj in appends:
+
+        # Place sheer outerwear in the HIGHEST recyclable slots (e.g. [30], [29]) or appended at the very end
+        # so body/legs/innerwear always render before semi-transparent outerwear.
+        sheer_leftovers = []
+        for aname, obj in reversed(sheer_appends):
             seed = replace(template_surf, name=aname)
-            surfaces.append(export_surface(obj, rig, seed, model.skeleton, continuous))
+            built = export_surface(obj, rig, seed, model.skeleton, continuous)
+            if recyclable:
+                target_idx = recyclable.pop()  # highest available hidden slot
+                surfaces[target_idx] = built
+            else:
+                sheer_leftovers.append(built)
+
+        # Place normal appended meshes into remaining recyclable slots (lowest upward), then append if any remain
+        for aname, obj in normal_appends:
+            seed = replace(template_surf, name=aname)
+            built = export_surface(obj, rig, seed, model.skeleton, continuous)
+            if recyclable:
+                target_idx = recyclable.pop(0)
+                surfaces[target_idx] = built
+            else:
+                surfaces.append(built)
+
+        for built in reversed(sheer_leftovers):
+            surfaces.append(built)
     if len(surfaces) > 31:
-        raise ValueError(f"导出总表面数 ({len(surfaces)}) 超过 TEW1 安全上限 31，请减少追加槽位。")
+        raise ValueError(
+            f"导出总表面数 ({len(surfaces)}) 超过 TEW1 安全上限 31。"
+            f"请先对不用的原版槽点「安全清零隐藏」（插件会自动回收复用），或用「合并同贴图/同材质网格」精简自定义网格数量。"
+        )
     if len(surfaces) == len(model.surfaces) and all(
         before is after for before, after in zip(model.surfaces, surfaces, strict=True)
     ):

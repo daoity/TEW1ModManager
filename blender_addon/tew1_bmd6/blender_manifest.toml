@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "tew1_bmd6"
-version = "2.7.0"
+version = "2.8.0"
 name = "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)"
-tagline = "内置原版模型一键提取与导入、BMD6 导出、MMD/VRChat 一键对骨（防双开门+脚掌1:1+内衣防穿模）、免转DDS/透纱材质、断肢拆分、TEW Physical 物理与表情"
+tagline = "内置原版模型提取、自动回收隐藏废槽(防pl0000_ng超31槽)、MMD/VRChat一键对骨(防双开门+脚掌1:1+内衣防穿模)、按贴图去重材质、断肢拆分与物理表情"
 maintainer = "TEW1 Mod Tools"
 type = "add-on"
 

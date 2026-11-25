@@ -65,9 +65,13 @@ LEG_BONES = frozenset({
 })
 
 
-def slot_role_tag(name):
+def is_havok_surface(name):
     low = name.lower()
-    if any(k in low for k in HAVOK_CLOTH_KEYWORDS):
+    return any(k in low for k in HAVOK_CLOTH_KEYWORDS)
+
+
+def slot_role_tag(name):
+    if is_havok_surface(name):
         return "Havok布料/原发(勿改顶点数)"
     if name in HEAD_ONLY_SLOTS:
         return "安全头部断肢槽"
@@ -84,13 +88,26 @@ def slot_role_tag(name):
     return "常规槽位"
 
 
+def count_recyclable_slots(rig, model):
+    """Count zero-hidden non-Havok stock slots that export_model() automatically recycles for appended meshes."""
+    count = 0
+    for obj in rig.children:
+        if obj.type != "MESH" or not obj.get(ZERO_HIDE):
+            continue
+        slot = int(obj.get(SLOT, -2))
+        if 0 <= slot < len(model.surfaces) and not is_havok_surface(model.surfaces[slot].name):
+            count += 1
+    return count
+
+
 def count_exported_surfaces(rig, model):
     base_count = len(model.surfaces)
     appended = sum(
         1 for obj in rig.children
         if obj.type == "MESH" and obj.get(SLOT, -2) == -1 and obj.get(APPEND_NAME, "").strip()
     )
-    return base_count + appended
+    recyclable = count_recyclable_slots(rig, model)
+    return base_count + max(0, appended - recyclable)
 
 
 def validate_rig_for_export(rig):
@@ -123,10 +140,13 @@ def validate_rig_for_export(rig):
 
     used_slots = {}
     bound_meshes = []
+    unbound_custom = []
     for obj in rig.children:
         if obj.type != "MESH":
             continue
         if SLOT not in obj:
+            if not obj.hide_viewport and not obj.hide_get() and not obj.get(ZERO_HIDE):
+                unbound_custom.append(obj.name)
             continue
         slot = int(obj[SLOT])
         if slot == -1:
@@ -218,7 +238,15 @@ def validate_rig_for_export(rig):
                     f"若含耳部/上颈/后脑皮肤请分离并移入 m_face（及断头模型 pl0001_ng），否则断头时头部会残留多出网格。"
                 )
 
-    summary = f"总表面 {total_surfs}/{MAX_SAFE_SURFACES} · 已绑定网格 {len(bound_meshes)} · 错误 {len(errors)} · 警告 {len(warnings)}"
+    if unbound_custom:
+        sample = ", ".join(unbound_custom[:5]) + ("..." if len(unbound_custom) > 5 else "")
+        warnings.append(
+            f"骨架下有 {len(unbound_custom)} 个可见自定义网格尚未指派 BMD6 槽位（不会被导出！）：{sample}。"
+            f"请选中它们点「指派/追加 网格与断肢槽位」（会自动回收隐藏的原版废槽）。"
+        )
+
+    recyclable = count_recyclable_slots(rig, model)
+    summary = f"总表面 {total_surfs}/{MAX_SAFE_SURFACES} (可回收隐藏槽 {recyclable}) · 已绑定 {len(bound_meshes)} · 错误 {len(errors)} · 警告 {len(warnings)}"
     return errors, warnings, summary
 
 
@@ -232,8 +260,11 @@ def _slot_enum_items(self, context):
     except Exception:
         return [("0", "模板读取失败", "")]
     items = [
-        ("APPEND_FACE", "+ 追加安全头部槽 (m_face)", "追加新表面用于头发/头饰（总表面须 <= 31）"),
-        ("APPEND_BODY", "+ 追加躯干槽 (m_shirt__nn)", "追加新表面用于衣服/配饰（总表面须 <= 31）"),
+        ("APPEND_FACE", "+ 头部/头发/面部槽 (m_face · 自动回收隐藏槽)", "支持多选批量指派！自动复用已隐藏的原版非 Havok 废槽，不超 31 上限"),
+        ("APPEND_BODY", "+ 躯干/服装槽 (m_shirt__nn · 自动回收隐藏槽)", "支持多选批量指派！自动复用已隐藏的原版废槽，适合躯干与衣服"),
+        ("APPEND_LARM", "+ 左臂断肢槽 (m_hand_l · 自动回收隐藏槽)", "支持多选批量指派！断左臂时自动隐藏"),
+        ("APPEND_RARM", "+ 右臂断肢槽 (m_r_shrit_arm__na · 自动回收隐藏槽)", "支持多选批量指派！断右臂时自动隐藏"),
+        ("APPEND_LEGS", "+ 双腿/鞋袜断肢槽 (m_pants_leg__np · 自动回收隐藏槽)", "支持多选批量指派！断腿/碾压时自动隐藏"),
     ]
     for idx, surf in enumerate(model.surfaces):
         tag = slot_role_tag(surf.name)
@@ -244,7 +275,7 @@ def _slot_enum_items(self, context):
 class TEW1AssignSlot(bpy.types.Operator):
     bl_idname = "object.tew1_assign_slot"
     bl_label = "指派 BMD6 网格/断肢槽位"
-    bl_description = "将当前选中的自定义网格绑定到指定 BMD6 模板槽位，或追加安全头部/躯干槽"
+    bl_description = "将选中的一个或多个自定义网格绑定到指定 BMD6 模板槽位，或批量指派到头部/躯干/四肢槽（自动回收已隐藏的非 Havok 原版槽，确保 <= 31 表面）"
     bl_options = {"REGISTER", "UNDO"}
 
     target_slot: EnumProperty(name="目标槽位", items=_slot_enum_items)
@@ -257,7 +288,7 @@ class TEW1AssignSlot(bpy.types.Operator):
         )
 
     def invoke(self, context, _event):
-        return context.window_manager.invoke_props_dialog(self, width=380)
+        return context.window_manager.invoke_props_dialog(self, width=420)
 
     def execute(self, context):
         from . import active_rig, template_bytes
@@ -268,14 +299,17 @@ class TEW1AssignSlot(bpy.types.Operator):
             return {"CANCELLED"}
         model = bmd6.read_model(template_bytes(rig))
 
-        if self.target_slot in ("APPEND_FACE", "APPEND_BODY"):
-            surf_name = "m_face" if self.target_slot == "APPEND_FACE" else "m_shirt__nn"
-            if surf_name not in [s.name for s in model.surfaces]:
-                if self.target_slot == "APPEND_FACE":
-                    for cand in ("m_face", "m_mouth3", "m_tong", "m_face1"):
-                        if cand in [s.name for s in model.surfaces]:
-                            surf_name = cand
-                            break
+        append_presets = {
+            "APPEND_FACE": ("m_face", ("m_face", "m_mouth3", "m_tong", "m_face1")),
+            "APPEND_BODY": ("m_shirt__nn", ("m_shirt__nn", "m_shirt", "m_pants", "m_vest")),
+            "APPEND_LARM": ("m_hand_l", ("m_hand_l", "m_l_hand", "m_arm_l")),
+            "APPEND_RARM": ("m_r_shrit_arm__na", ("m_r_shrit_arm__na", "m_hand_r", "m_hand_R", "m_arm_r")),
+            "APPEND_LEGS": ("m_pants_leg__np", ("m_pants_leg__np", "m_boots2__bt", "m_boots1", "m_boots")),
+        }
+        if self.target_slot in append_presets:
+            default_name, fallbacks = append_presets[self.target_slot]
+            existing_names = {s.name for s in model.surfaces}
+            surf_name = next((c for c in fallbacks if c in existing_names), default_name)
             for obj in meshes:
                 mat = obj.matrix_world.copy()
                 obj.parent = rig
@@ -288,10 +322,18 @@ class TEW1AssignSlot(bpy.types.Operator):
                     mod = obj.modifiers.new("TEW1 Armature", "ARMATURE")
                     mod.object = rig
             total = count_exported_surfaces(rig, model)
+            recyc = count_recyclable_slots(rig, model)
             if total > MAX_SAFE_SURFACES:
-                self.report({"WARNING"}, f"已追加到 {surf_name}，但当前总表面 {total} > {MAX_SAFE_SURFACES}，请减少追加槽位！")
+                self.report(
+                    {"WARNING"},
+                    f"已指派 {len(meshes)} 个网格到 {surf_name}，但当前总表面 {total} > {MAX_SAFE_SURFACES}（可回收隐藏槽 {recyc}）。"
+                    f"请隐藏不用的原版槽，或用「合并同贴图/同材质零碎网格」精简数量！",
+                )
             else:
-                self.report({"INFO"}, f"已将 {len(meshes)} 个网格追加到安全槽 {surf_name}（总表面 {total}/{MAX_SAFE_SURFACES}）。")
+                self.report(
+                    {"INFO"},
+                    f"已将 {len(meshes)} 个网格指派到 {surf_name}（导出表面 {total}/{MAX_SAFE_SURFACES}，可回收隐藏槽 {recyc}）。",
+                )
             return {"FINISHED"}
 
         if len(meshes) != 1:
@@ -522,6 +564,63 @@ class TEW1ValidateModel(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class TEW1MergeSameMaterialMeshes(bpy.types.Operator):
+    bl_idname = "object.tew1_merge_same_material_meshes"
+    bl_label = "合并同材质/同贴图零碎网格"
+    bl_description = "将当前选中的多个网格按「相同 TEW1 材质路径或相同底色贴图（且同断肢槽分类）」自动合并，完整保留形态键与权重，大幅精简表面数量"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        meshes = [o for o in context.selected_objects if o.type == "MESH" and not o.get(ZERO_HIDE)]
+        return context.mode == "OBJECT" and len(meshes) >= 2
+
+    def execute(self, context):
+        from .tex_encode import find_material_albedo_image
+        meshes = [o for o in context.selected_objects if o.type == "MESH" and not o.get(ZERO_HIDE)]
+        if len(meshes) < 2:
+            self.report({"WARNING"}, "请至少选中 2 个待合并的自定义网格。")
+            return {"CANCELLED"}
+
+        groups = {}
+        for obj in meshes:
+            mat = obj.data.materials[0] if (obj.data.materials and obj.data.materials[0]) else None
+            mpath = str(mat.get("tew1_material_path", "")).strip() if mat else ""
+            if not mpath and mat is not None:
+                img = find_material_albedo_image(mat)
+                mpath = f"img:{img.name}" if img else f"mat:{mat.name}"
+            if not mpath:
+                continue
+            slot_key = (int(obj.get(SLOT, -2)), str(obj.get(APPEND_NAME, "")))
+            groups.setdefault((mpath, slot_key), []).append(obj)
+
+        merged_groups = 0
+        removed_objs = 0
+        prev_active_name = context.view_layer.objects.active.name if context.view_layer.objects.active else ""
+        for (_mpath, _skey), objs in groups.items():
+            if len(objs) < 2:
+                continue
+            bpy.ops.object.select_all(action="DESELECT")
+            target = objs[0]
+            for o in objs:
+                o.select_set(True)
+            context.view_layer.objects.active = target
+            bpy.ops.object.join()
+            # Keep only first material slot on merged mesh so BMD6 exports cleanly
+            while len(target.data.materials) > 1:
+                target.data.materials.pop()
+            merged_groups += 1
+            removed_objs += len(objs) - 1
+
+        if prev_active_name and prev_active_name in bpy.data.objects:
+            context.view_layer.objects.active = bpy.data.objects[prev_active_name]
+        if merged_groups == 0:
+            self.report({"INFO"}, "选中的网格中没有可合并的同贴图/同材质组。")
+            return {"FINISHED"}
+        self.report({"INFO"}, f"合并完成：将 {merged_groups} 组同材质/同贴图网格合并，精简了 {removed_objs} 个表面！")
+        return {"FINISHED"}
+
+
 class TEW1PackModZip(bpy.types.Operator, ExportHelper):
     bl_idname = "export_scene.tew1_pack_mod_zip"
     bl_label = "一键打包为 Mod ZIP"
@@ -546,13 +645,20 @@ class TEW1PackModZip(bpy.types.Operator, ExportHelper):
             files = [p for p in base_dir.rglob("*") if p.is_file()]
             if not files:
                 raise ValueError("base/ 目录为空，没有可打包的文件。")
+            has_model = any(p.suffix.lower() == ".bmd6model" for p in files)
+            has_audio = any(p.suffix.lower() == ".wav" for p in files)
+            if not has_model and not has_audio:
+                raise ValueError(
+                    "挂载目录 base/ 中没有任何 .bmd6model 模型文件（当前只有贴图/材质）！"
+                    "请先完成槽位指派并点击「导出 BMD6 到挂载目录」或「一键同步导出 BMD6 + tew1_dyn.bin」再打包。"
+                )
 
             mod_info = (
                 f"name={ws.mod_name.strip() or 'Custom TEW1 Character Mod'}\n"
                 f"author={ws.mod_author.strip() or 'TEW1 Modder'}\n"
                 f"version={ws.mod_version.strip() or '1.0'}\n"
-                f"type=model\n"
-                f"description={ws.mod_desc.strip() or 'Authored with TEW1 BMD6 Blender Plugin v2.0 (TEW Physical)'}\n"
+                f"type={'model' if has_model else 'voice'}\n"
+                f"description={ws.mod_desc.strip() or 'Authored with TEW1 BMD6 Blender Plugin v2.8 (TEW Physical)'}\n"
             )
 
             out_zip = Path(self.filepath)
@@ -573,6 +679,7 @@ CLASSES = (
     TEW1AssignSlot,
     TEW1SafeHideSlot,
     TEW1AutoSplitBodyDismember,
+    TEW1MergeSameMaterialMeshes,
     TEW1NormalizeWeights,
     TEW1ValidateModel,
     TEW1PackModZip,

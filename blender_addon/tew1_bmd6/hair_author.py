@@ -51,7 +51,11 @@ PHYSICS_PRESETS = {
     "STIFF_SKIRT":    (220.0, 0.32, 15.0, 0.45, "硬挺衣摆/裙摆",  "裙摆、大衣下摆，高回弹防穿透腿部"),
 }
 
-DEFAULT_CHAIN_KEYWORDS = "hair,bang,lock,ponytail,twin,ribbon,braid,skirt,cape,tail,cloth,髪,发,刘海,马尾,飘带,裙,衣摆"
+DEFAULT_CHAIN_KEYWORDS = (
+    "hair,bang,lock,ponytail,twin,ribbon,braid,skirt,cape,tail,cloth,scarf,sleeve,"
+    "髪,前髪,後髪,横髪,もみあげ,三つ編み,おさげ,ツインテ,ポニテ,リボン,スカート,袖,マフラー,マント,フリル,ネクタイ,おっぱい,"
+    "发,刘海,马尾,麻花辫,飘带,丝带,裙,衣摆,围巾"
+)
 
 
 def rig_object(context):

@@ -237,24 +237,38 @@ def _sanitize_slug(text, fallback):
 
 def _guess_preset(mat, rgba):
     name = mat.name.lower()
-    # Tight innerwear/panties/bra MUST stay opaque BC1 so transparent-padding pixels never turn innerwear sheer!
+    # 1. Tight innerwear/panties/bra MUST stay opaque BC1 so transparent-padding pixels never turn innerwear sheer!
     if any(k in name for k in ("panty", "panties", "underwear", "innerwear", "inner_wear", "bra", "lingerie", "briefs", "内裤", "内衣", "胖次", "胸罩")):
         return "OPAQUE"
+    # 2. Explicit sheer outerwear
     if any(k in name for k in ("sheer", "gauze", "chiffon", "pajama_outer", "outer_sheer", "透纱", "薄纱", "半透外套", "睡衣外套")):
         return "SHEER_OUTER"
-    if any(k in name for k in ("lash", "eyelash", "lace", "alpha", "trans", "cutout", "睫毛", "蕾丝", "透明")):
+    # 3. Explicit alpha-cutout overlays (eyelashes, blush decals, tears, hair shadow/kiwa, lace)
+    if any(k in name for k in (
+        "lash", "eyelash", "eyebrush", "brow", "tear", "tere", "blush", "shadow", "kiwa", "hacyu",
+        "lace", "alpha", "trans", "cutout", "decal", "睫毛", "眉", "泪", "腮红", "蕾丝", "透明",
+    )):
         return "CUTOUT"
+    # 4. Solid hair (never misclassify MMD 32-bit TGA hair atlases with empty padding as CUTOUT!)
+    if any(k in name for k in ("hair", "maegami", "bang", "ponytail", "braid", "髪", "发")):
+        return "HAIR"
+    # 5. Core solid face/body/clothing/eye/mouth materials (protect against 32-bit TGA atlas padding!)
+    if any(k in name for k in (
+        "face", "skin", "body", "head", "wear", "cloth", "shirt", "pants", "skirt", "dress", "coat",
+        "jacket", "shoes", "boots", "sock", "hand", "glove", "scarf", "ribbon", "tie", "belt",
+        "tongue", "teeth", "mouth", "eye", "eyehole", "hau", "脸", "颜", "肤", "身", "衣", "服", "裤", "鞋", "手", "舌", "眼",
+    )):
+        return "OPAQUE"
+    # 6. Fallback heuristic for unknown material names: require genuine alpha pixels
     if rgba is not None and int((rgba[:, :, 3] < 240).sum()) > max(64, rgba.shape[0] * rgba.shape[1] // 200):
         return "CUTOUT"
-    if any(k in name for k in ("hair", "bang", "髪", "发")):
-        return "HAIR"
     return "OPAQUE"
 
 
 class TEW1BatchConvertMaterials(bpy.types.Operator):
     bl_idname = "material.tew1_batch_convert"
     bl_label = "一键自动转换角色全部材质 (免手动转DDS)"
-    bl_description = "自动读取选中网格或当前骨架下所有自定义网格的 Blender 贴图（PNG/TGA/JPG/内嵌图），智能区分不透明/发片/透明裁切，批量生成 .bimage 与 .decl 并自动绑定路径"
+    bl_description = "自动读取选中网格或当前骨架下所有自定义网格的 Blender 贴图（PNG/TGA/JPG/内嵌图），自动按贴图去重（大幅减小包体），智能区分不透明/发片/透明裁切/透纱外套，批量生成 .bimage 与 .decl 并绑定路径"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -281,8 +295,10 @@ class TEW1BatchConvertMaterials(bpy.types.Operator):
 
         prefix = _sanitize_slug(ws.batch_mat_prefix, "tew_custom")
         converted = {}
+        dedup_by_tex = {}  # (image.name, preset) -> key
         skipped = []
         idx = 0
+        reused = 0
         for obj in meshes:
             if not obj.data.materials or obj.data.materials[0] is None:
                 skipped.append(f"{obj.name}(无材质)")
@@ -297,9 +313,19 @@ class TEW1BatchConvertMaterials(bpy.types.Operator):
             try:
                 rgba = rgba_from_blender_image(img)
                 preset = _guess_preset(mat, rgba)
+                tex_sig = (img.name, preset)
+                if tex_sig in dedup_by_tex:
+                    key = dedup_by_tex[tex_sig]
+                    mat["tew1_material_path"] = key
+                    mat["tew1_sheer_outer"] = (preset == "SHEER_OUTER")
+                    converted[mat] = (key, preset)
+                    reused += 1
+                    continue
                 key = f"textures/{prefix}/mat_{idx:02d}"
                 key = native_material_path(key)
                 index_num, alpha, _ = PRESETS[preset]
+                if not alpha:
+                    rgba[:, :, 3] = 255
                 color = key + "_c"
                 albedo = bimage_from_rgba(rgba, use_bc3=alpha)
                 decl = build.material(index_num, alpha, texture=color)
@@ -307,6 +333,7 @@ class TEW1BatchConvertMaterials(bpy.types.Operator):
                 build.put(root, f"generated/decls/material/{key}.decl", decl)
                 mat["tew1_material_path"] = key
                 mat["tew1_sheer_outer"] = (preset == "SHEER_OUTER")
+                dedup_by_tex[tex_sig] = key
                 converted[mat] = (key, preset)
                 idx += 1
             except Exception as err:
@@ -316,7 +343,8 @@ class TEW1BatchConvertMaterials(bpy.types.Operator):
             self.report({"ERROR"}, "未能转换任何材质：" + "; ".join(skipped[:4]))
             return {"CANCELLED"}
         extra = f"，跳过 {len(skipped)} 个" if skipped else ""
-        self.report({"INFO"}, f"已一键生成并绑定 {len(converted)} 套 TEW1 材质（textures/{prefix}/mat_00..）{extra}！")
+        dedup_msg = f"（按贴图去重复用 {reused} 处）" if reused else ""
+        self.report({"INFO"}, f"已生成 {idx} 套唯一 TEW1 材质并绑定 {len(converted)} 个材质槽{dedup_msg}{extra}！")
         return {"FINISHED"}
 
 

@@ -15,6 +15,7 @@ from .dismember import (
     SLOT,
     ZERO_HIDE,
     count_exported_surfaces,
+    count_recyclable_slots,
     slot_role_tag,
 )
 from .dyn_export import COLLIDER_BONES, scan_rig_shape_keys
@@ -121,7 +122,8 @@ class VIEW3D_PT_tew1_io(bpy.types.Panel):
             if model is not None:
                 over = total_surfs > MAX_SAFE_SURFACES
                 icon = "ERROR" if over else "CHECKMARK"
-                col.label(text=f"导出表面数: {total_surfs} / {MAX_SAFE_SURFACES}", icon=icon)
+                recyc = count_recyclable_slots(rig, model)
+                col.label(text=f"导出表面数: {total_surfs} / {MAX_SAFE_SURFACES} (可回收废槽 {recyc})", icon=icon)
 
             actions = layout.column(align=True)
             actions.scale_y = 1.15
@@ -257,8 +259,9 @@ class VIEW3D_PT_tew1_mesh_tools(bpy.types.Panel):
             info.label(text="选中任意网格以查看/分配槽位", icon="INFO")
 
         col = layout.column(align=True)
-        col.operator("object.tew1_assign_slot", text="指派/追加 网格与断肢槽位...", icon="MESH_DATA")
+        col.operator("object.tew1_assign_slot", text="指派/批量追加 网格与断肢槽位 (自动回收废槽)...", icon="MESH_DATA")
         col.operator("object.tew1_split_body_dismember", text="一键按权重拆分身体断肢 (4部位)", icon="MOD_EXPLODE")
+        col.operator("object.tew1_merge_same_material_meshes", text="合并同材质/同贴图零碎网格 (精简表面)", icon="AUTOMERGE_ON")
         col.operator("object.tew1_safe_hide_slot", text="切换原版槽「安全清零隐藏」", icon="HIDE_ON")
 
         layout.separator(factor=0.5)
