@@ -44,9 +44,9 @@ description: End-to-end production workflow, reverse-engineered binary specs, Bl
 
 ## 标准生产 SOP
 
-### 流程 A：制作自定义角色模型 + 换骨对骨 + 断肢（Blender 插件 v2.6 `TEW Mesh`，兼容 Blender 4.0–5.2+）
-1. 在 Blender 4.0–5.2+ 安装 `dist/恶灵附身1_BMD6_Blender插件_v2.6_TEW_Physical_Blender4-5.zip`。
-2. 在 **`TEW Mesh` → `1. 导入导出 & 挂载区`** 选好外部挂载目录，点 **`导入 BMD6`** 导入原版模板（如 `pl0000_ng.bmd6model`），并导入源 MMD/VRChat 角色。
+### 流程 A：制作自定义角色模型 + 换骨对骨 + 断肢（Blender 插件 v2.7 `TEW Mesh`，兼容 Blender 4.0–5.2+）
+1. 在 Blender 4.0–5.2+ 安装 `dist/恶灵附身1_BMD6_Blender插件_v2.7_TEW_Physical_Blender4-5.zip`。
+2. 在 **`TEW Mesh` → `1. 导入导出 & 挂载区`** 选好外部挂载目录；可直接点 **`一键从游戏提取并导入主模板 (pl0000_ng)`**（或 **`批量提取原版 .bmd6model 模型库...`** / `TEW1ModManager.exe` 顶部「提取原版模型」 / `tools/TEW1_TangoResource_Extractor.py` 从游戏 `.tangoresource` 解包提取），然后导入源 MMD/VRChat 角色。
 3. **内置 MMD/VRChat 一键对骨（自带防双开门 + 脚掌 1:1 贴地）**：在 **`2. 一键对骨、重命名与换骨`** 勾选 **`保持原版肩宽与脚掌 1:1 比例`** 与 **`自动修复「双开门」肩头内侧权重`**，点 **`一键对骨、重命名并绑定到 TEW1 骨架`**（真实脚底贴地 `Z=0.10`、双大腿中点 X 对齐防腰胯折痕、无损 LBS 保留形态键、自动转移内侧肩头权重给 `l/r_shoulder`、迁移物理发骨）。
    - 手动对骨或微调后，可随时使用下方独立按钮 **`一键修复「双开门」肩宽权重`** 与 **`贴身内衣/内裤防穿模（先选内衣再选皮肤）`**。
 4. **免转 DDS 一键材质（区分实色内衣与透纱外套）**：在 **`3. 材质制作`** 填前缀名，点 **`一键转换角色全部材质 (免转DDS)`**。纯 NumPy 编码器会自动将内裤/内衣强制归为 **100% 不透明 BC1 (`OPAQUE`)**，将薄纱外套归为 **`SHEER_OUTER` (`BC3`, `clipthreshold 0.05`)**；导出 BMD6 时插件会自动把透纱外套追加槽排在最后绘制。
