@@ -2,10 +2,11 @@
 
 根目录：`F:\HG\evil\TEW1ModManager\`
 
-## 1. Blender 插件 v2.6（兼容 Blender 4.0–5.2+，面向手工作者的完整制作套件）
+## 1. Blender 插件 v2.7（兼容 Blender 4.0–5.2+，面向手工作者的完整制作套件）
 - 源码目录：`blender_addon/tew1_bmd6/`
-- 发布安装包：`dist/恶灵附身1_BMD6_Blender插件_v2.6_TEW_Physical_Blender4-5.zip`
+- 发布安装包：`dist/恶灵附身1_BMD6_Blender插件_v2.7_TEW_Physical_Blender4-5.zip`
 - 模块结构（参考 `NSACloud/RE-Mesh-Editor` 模块化架构 + 内置 ModToolkit MMD/VRChat 预设）：
+  - `tango_extract.py`：内置 `.tangoresource` 解包提取器（自动搜索游戏目录、**一键提取并直接导入 `pl0000_ng`/`pl0020_ng`/`pl0010_ng`/`pl0001_ng`**、按主角全章节/全人物 `pl*`/全怪物 `em*`/全游戏 `.bmd6model` 批量提取），彻底解决新手“找不到 `.bmd6model`”问题。
   - `compat.py`：Blender 4.0–5.2+ 兼容封装（PoseBone 选择、Slotted Action 关键帧、材质节点）。
   - `__init__.py`：`.bmd6model` 读写桥接、`File > Import / Export` 菜单、槽位替换/追加（自动把透纱外套追加槽排到最后绘制）、安全清零隐藏。
   - `bmd6.py` / `build.py` / `geometry.py` / `presets.py`：BMD6 二进制读写、网格流编码、连续切线、默认 `shoulder_fit=0.0` + 1:1 刚体脚掌 + C1 腰胯过渡、4 套前向材质模板（含 `SHEER_OUTER` 透纱外套）。
@@ -29,9 +30,11 @@
 - `build_haruka_voice_pack.py`：主角动作/受击/QTE 语音响度补偿与 `.bsnd` 等时长静音生成器。
 - `build_mod_zip.py`：批量打包可发布 Mod ZIP 脚本。
 
-## 3. 便携 WPF Mod 管理器与原生挂载器 (`src/` & `dist/`)
+## 3. 便携 WPF Mod 管理器与独立提取器 (`src/` & `tools/` & `dist/`)
 - `src/NativeLoader.cs`：挂起拉起 `EvilWithin.exe`，注入 6 处散文件内存补丁并可选注入 `tew1_dyn_runtime.dll`。
-- `src/MainWindow.cs` / `src/OverlayLibrary.cs`：模型单选启动 + 语音等功能性 Mod 独立启用/关闭 + 物理/表情开关 + 覆盖合并。
+- `src/TangoExtractor.cs`：内置 C# `.tangoresource` 原版 `.bmd6model` 提取器（使用 .NET 原生 `DeflateStream` 零依赖解压，可在管理器顶部栏一键导出核心 27 模/全人物/全怪物/全游戏模型）。
+- `src/MainWindow.cs` / `src/OverlayLibrary.cs`：模型单选启动 + 语音等功能性 Mod 独立启用/关闭 + 物理/表情开关 + 覆盖合并 + 顶部一键提取原版模型。
+- `tools/TEW1_TangoResource_Extractor.py`：独立零依赖 Python GUI+CLI 资源提取工具（`.bmd6model` / `.bimage` / `.decl` / `.wav`）。
 - `dist/TEW1ModManager.exe` / `dist/TEW1ModManager_纯净版.exe`：单文件便携管理器成品。
 
 ## 4. 完整人工教程
