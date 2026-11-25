@@ -217,8 +217,8 @@ def validate_rig_for_export(rig):
             for g in v.groups:
                 if vg_names.get(g.group) in skel_names and g.weight > 1e-6:
                     has_nat = True
-                if tgt_upper_y and tgt_upper_y > 4.0 and g.group in (lu_i, ru_i) and g.weight > 0.35:
-                    if abs(float(v_arm[v.index, 1])) < tgt_upper_y * 0.82:
+                if tgt_upper_y and tgt_upper_y > 4.0 and g.group in (lu_i, ru_i) and g.weight > 0.50:
+                    if abs(float(v_arm[v.index, 1])) < tgt_upper_y * 0.68:
                         medial_upperarm_verts += 1
             if not has_nat:
                 unweighted += 1
@@ -490,7 +490,7 @@ class TEW1AutoSplitBodyDismember(bpy.types.Operator):
 class TEW1NormalizeWeights(bpy.types.Operator):
     bl_idname = "object.tew1_normalize_weights"
     bl_label = "规范化骨骼权重 (TEW1 上限4骨骼)"
-    bl_description = "移除空权重组、限制每顶点最多 4 根骨骼影响并归一化权重，避免 BMD6 量化变形"
+    bl_description = "将原生骨骼权重独立限制在 4 根以内并归一化（绝不让物理骨挤掉原生骨！），同时自动为仅绑了物理骨的顶点补回最近原生父骨权重"
     bl_options = {"REGISTER", "UNDO"}
 
     remove_non_native: BoolProperty(
@@ -506,34 +506,108 @@ class TEW1NormalizeWeights(bpy.types.Operator):
         from . import active_rig, template_bytes
         from .hair_author import profile as hair_profile
         rig = active_rig(context)
-        allowed = None
-        if self.remove_non_native and rig is not None:
+        native_names = None
+        allowed_non_native = set()
+        bone_native_parent = {}
+        if rig is not None:
             try:
                 model = bmd6.read_model(template_bytes(rig))
-                allowed = set(model.skeleton.names)
+                native_names = set(model.skeleton.names)
                 for ch in hair_profile(rig).get("chains", []):
-                    allowed.update(ch.get("bones", []))
+                    allowed_non_native.update(ch.get("bones", []))
+                # Precompute nearest native ancestor for every extra bone on rig
+                for b in rig.data.bones:
+                    if b.name in native_names:
+                        continue
+                    cur = b.parent
+                    while cur is not None and cur.name not in native_names:
+                        cur = cur.parent
+                    if cur is not None:
+                        bone_native_parent[b.name] = cur.name
+                    else:
+                        bone_native_parent[b.name] = "head" if "head" in native_names else "pelvis"
             except Exception:
-                allowed = None
+                native_names = None
 
         processed = 0
         removed_groups = 0
+        repaired_verts = 0
         prev_active = context.view_layer.objects.active
         for obj in [o for o in context.selected_objects if o.type == "MESH"]:
             if not obj.vertex_groups:
                 continue
-            if allowed is not None:
-                for vg in list(obj.vertex_groups):
-                    if vg.name not in allowed:
-                        obj.vertex_groups.remove(vg)
-                        removed_groups += 1
-            context.view_layer.objects.active = obj
-            bpy.ops.object.vertex_group_clean(group_select_mode="ALL", limit=1e-4)
-            bpy.ops.object.vertex_group_limit_total(group_select_mode="ALL", limit=4)
-            bpy.ops.object.vertex_group_normalize_all(group_select_mode="ALL", lock_active=False)
+            if native_names is not None:
+                if self.remove_non_native:
+                    allowed = native_names | allowed_non_native
+                    for vg in list(obj.vertex_groups):
+                        if vg.name not in allowed:
+                            obj.vertex_groups.remove(vg)
+                            removed_groups += 1
+
+                # Limit & normalize native TEW1 bone weights INDEPENDENTLY from physics bone weights
+                # so Blender's limit_total(4) NEVER crowds out native head/pelvis weights with hair/skirt bones!
+                vg_by_idx = {vg.index: vg for vg in obj.vertex_groups}
+                fallback_vg_cache = {vg.name: vg for vg in obj.vertex_groups}
+
+                def get_vg(bname):
+                    vg = fallback_vg_cache.get(bname)
+                    if vg is None:
+                        vg = obj.vertex_groups.new(name=bname)
+                        fallback_vg_cache[bname] = vg
+                        vg_by_idx[vg.index] = vg
+                    return vg
+
+                for v in obj.data.vertices:
+                    nat_items = []
+                    extra_items = []
+                    for g in v.groups:
+                        vg = vg_by_idx.get(g.group)
+                        if vg is None:
+                            continue
+                        if g.weight <= 1e-4:
+                            vg.remove([v.index])
+                            continue
+                        if vg.name in native_names:
+                            nat_items.append((vg, float(g.weight)))
+                        else:
+                            extra_items.append((vg, float(g.weight)))
+
+                    if not nat_items:
+                        # Auto-repair vertex that only has physics/extra weights -> bind to nearest native ancestor
+                        fb_name = "pelvis" if "pelvis" in native_names else "origin"
+                        if extra_items:
+                            best_extra = max(extra_items, key=lambda x: x[1])[0].name
+                            fb_name = bone_native_parent.get(best_extra, fb_name)
+                        elif "head" in native_names:
+                            fb_name = "head"
+                        fb_vg = get_vg(fb_name)
+                        fb_vg.add([v.index], 1.0, "REPLACE")
+                        repaired_verts += 1
+                    else:
+                        nat_items.sort(key=lambda x: -x[1])
+                        for drop_vg, _ in nat_items[4:]:
+                            drop_vg.remove([v.index])
+                        keep = nat_items[:4]
+                        total = sum(w for _, w in keep)
+                        if total > 1e-6:
+                            for keep_vg, w in keep:
+                                keep_vg.add([v.index], w / total, "REPLACE")
+
+                    # Also cap extra/physics weights to top 4 among themselves without touching native weights
+                    if len(extra_items) > 4:
+                        extra_items.sort(key=lambda x: -x[1])
+                        for drop_vg, _ in extra_items[4:]:
+                            drop_vg.remove([v.index])
+            else:
+                context.view_layer.objects.active = obj
+                bpy.ops.object.vertex_group_clean(group_select_mode="ALL", limit=1e-4)
+                bpy.ops.object.vertex_group_limit_total(group_select_mode="ALL", limit=4)
+                bpy.ops.object.vertex_group_normalize_all(group_select_mode="ALL", lock_active=False)
             processed += 1
+
         context.view_layer.objects.active = prev_active
-        self.report({"INFO"}, f"已规范化 {processed} 个网格权重（清理多余组 {removed_groups} 个）。")
+        extra_msg = f"，自动补回 {repaired_verts} 个缺失原生骨顶点" if repaired_verts else ""
+        self.report({"INFO"}, f"已规范化 {processed} 个网格权重（独立保留物理骨，清理多余组 {removed_groups} 个{extra_msg}）。")
         return {"FINISHED"}
 
 
