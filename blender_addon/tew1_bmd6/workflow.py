@@ -18,6 +18,11 @@ def loose_root(value):
 
 
 class TEW1Workspace(bpy.types.PropertyGroup):
+    game_dir: StringProperty(
+        name="游戏本体目录",
+        subtype="DIR_PATH",
+        description="《恶灵附身 1》安装目录（含 EvilWithin.exe 与 base/*.tangoresource），仅用于只读提取原版 .bmd6model 模板，绝不写入任何文件",
+    )
     overlay: StringProperty(
         name="挂载目录",
         subtype="DIR_PATH",

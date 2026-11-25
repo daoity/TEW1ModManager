@@ -89,6 +89,17 @@ class VIEW3D_PT_tew1_io(bpy.types.Panel):
         row.operator("import_scene.tew1_bmd6", text="导入 BMD6", icon="IMPORT")
         row.operator("export_scene.tew1_bmd6", text="另存 BMD6", icon="EXPORT")
 
+        # Built-in Stock Model Extractor (solves "no .bmd6model files to import")
+        ext_box = layout.box()
+        ext_box.label(text="没有 .bmd6model？直接从游戏提取原版模型", icon="FILE_ARCHIVE")
+        g_row = ext_box.row(align=True)
+        g_row.prop(ws, "game_dir", text="")
+        g_row.operator("object.tew1_detect_game_dir", text="", icon="VIEWZOOM")
+        ex_col = ext_box.column(align=True)
+        ex_col.scale_y = 1.1
+        ex_col.operator("import_scene.tew1_quick_import_stock", text="一键从游戏提取并导入主模板 (pl0000_ng)", icon="IMPORT")
+        ex_col.operator("object.tew1_extract_game_models", text="批量提取原版 .bmd6model 模型库...", icon="EXPORT")
+
         # Workspace / Overlay Box
         box = layout.box()
         box.label(text="Mod 外部挂载目录（切勿选游戏本体目录）", icon="FILE_FOLDER")

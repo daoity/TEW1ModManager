@@ -407,7 +407,9 @@ def hidden(surface):
 
 
 def relative_asset(name):
-    return f'{ASSET_ROOT}/{name.split("_", 1)[0]}/model/{name}.bmd6model'
+    stem = name.split("_", 1)[0]
+    kind = "em" if stem.startswith("em") else "pl"
+    return f'generated/nextgen/characters/{kind}/{stem}/model/{name}.bmd6model'
 
 
 def put(root, relative, data):

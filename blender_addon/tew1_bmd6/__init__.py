@@ -2,10 +2,10 @@
 bl_info = {
     "name": "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)",
     "author": "TEW1 Mod Tools",
-    "version": (2, 6, 0),
+    "version": (2, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (TEW Mesh / TEW Physical) & File > Import / Export",
-    "description": "兼容 Blender 4.0–5.2+：恶灵附身 1 BMD6 导入导出、MMD/VRChat 一键对骨（防双开门窄肩修正+脚掌1:1贴地+贴身内衣防穿模）、免转DDS一键材质（支持透纱外套）、断肢拆分、TEW Physical 实时物理与 TEW Facial 表情。",
+    "description": "兼容 Blender 4.0–5.2+：内置原版游戏 .tangoresource 一键提取与导入、BMD6 读写、MMD/VRChat 一键对骨（防双开门窄肩+脚掌1:1+内衣防穿模）、免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情。",
     "category": "Import-Export",
 }
 
@@ -247,7 +247,7 @@ def import_model(context, filename):
         relative = filename.relative_to(base).as_posix()
         if relative.startswith("generated/nextgen/"):
             rig["tew1_overlay_asset"] = relative
-    elif re.fullmatch(r"pl[0-9]{4}(?:_[a-z]+)?", filename.stem):
+    elif re.fullmatch(r"(?:pl|em)[0-9]{4}(?:_[a-z]+)?", filename.stem):
         rig["tew1_overlay_asset"] = build.relative_asset(filename.stem)
     materials = {}
     for slot, surface in enumerate(model.surfaces):
@@ -454,7 +454,8 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(import_menu)
     bpy.types.TOPBAR_MT_file_export.append(export_menu)
-    from . import dismember, dyn_export, facial_author, hair_author, rig_tools, tex_encode, ui_panels, workflow
+    from . import dismember, dyn_export, facial_author, hair_author, rig_tools, tango_extract, tex_encode, ui_panels, workflow
+    tango_extract.register()
     dismember.register()
     rig_tools.register()
     tex_encode.register()
@@ -466,7 +467,7 @@ def register():
 
 
 def unregister():
-    from . import dismember, dyn_export, facial_author, hair_author, rig_tools, tex_encode, ui_panels, workflow
+    from . import dismember, dyn_export, facial_author, hair_author, rig_tools, tango_extract, tex_encode, ui_panels, workflow
     ui_panels.unregister()
     dyn_export.unregister()
     facial_author.unregister()
@@ -475,6 +476,7 @@ def unregister():
     tex_encode.unregister()
     rig_tools.unregister()
     dismember.unregister()
+    tango_extract.unregister()
     bpy.types.TOPBAR_MT_file_export.remove(export_menu)
     bpy.types.TOPBAR_MT_file_import.remove(import_menu)
     for cls in reversed(CLASSES):

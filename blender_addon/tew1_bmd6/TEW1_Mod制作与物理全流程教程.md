@@ -1,8 +1,8 @@
-# 《恶灵附身 1》（The Evil Within 1）Mod 傻瓜化制作全流程教程（v2.6）
+# 《恶灵附身 1》（The Evil Within 1）Mod 傻瓜化制作全流程教程（v2.7）
 
 > **适配软件**：**Blender 4.0 — Blender 5.2+ LTS**（已内置 4/5 兼容层）  
-> **插件包**：`恶灵附身1_BMD6_Blender插件_v2.6_TEW_Physical_Blender4-5.zip`  
-> **特点**：**无需外部 ModToolkit、无需手动转 DDS！** 内置 MMD / VRChat 预设一键对骨重命名（**自带防“双开门”窄肩修正、脚掌 1:1 真实贴地防拉长、贴身内衣防穿模**）、一键免转 DDS/透纱材质生成、一键断肢拆分、`TEW Physical` 实时物理、`TEW Facial` 物理表情与 CG 嘴骨生成、一键打包 Mod ZIP！  
+> **插件包**：`恶灵附身1_BMD6_Blender插件_v2.7_TEW_Physical_Blender4-5.zip`  
+> **特点**：**无需外部提取工具、无需外部 ModToolkit、无需手动转 DDS！** **自带原版 `.tangoresource` 模型一键提取与导入**（解决“找不到 `.bmd6model` 文件”问题）、内置 MMD / VRChat 预设一键对骨重命名（自带防“双开门”窄肩修正、脚掌 1:1 真实贴地、贴身内衣防穿模）、一键免转 DDS/透纱材质生成、一键断肢拆分、`TEW Physical` 实时物理、`TEW Facial` 物理表情与 CG 嘴骨生成、一键打包 Mod ZIP！  
 > **提示**：插件里**每一个按钮和滑块鼠标悬停 1 秒**都会弹出详细中文说明，忘记某一步直接把鼠标放上去看即可。
 
 ---
@@ -28,17 +28,23 @@
 ## 0. 安装插件（仅首次）
 
 1. 打开 Blender（4.0 ~ 5.2 均可）→ `编辑 (Edit)` → `偏好设置 (Preferences)` → `插件 (Add-ons)`。
-2. 点击右上角菜单 → **`从磁盘安装 (Install from Disk...)`**，选中 `恶灵附身1_BMD6_Blender插件_v2.6_TEW_Physical_Blender4-5.zip`。
+2. 点击右上角菜单 → **`从磁盘安装 (Install from Disk...)`**，选中 `恶灵附身1_BMD6_Blender插件_v2.7_TEW_Physical_Blender4-5.zip`。
 3. 勾选启用 **`Import-Export: TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)`**。
 4. 在 3D 视口按 **`N`** 键，右侧出现两个标签页：**`TEW Mesh`**（建模/换骨/材质/断肢/打包）和 **`TEW Physical`**（物理/碰撞体/自发光/物理表情）。
 
 ---
 
-## 第一步：导入原版模板与外部挂载目录
+## 第一步：获取原版模板（内置一键提取！）与外部挂载目录
+
+> ❓ **为什么游戏文件夹里找不到 `.bmd6model` 文件？**  
+> 因为游戏原版模型都打包在 `base/*.tangoresource` 档案里！**v2.7 起不再需要另外找提取工具**，Blender 插件与 Mod 管理器均已内置一键提取功能（同时也附带了独立脚本 `TEW1_TangoResource_Extractor.py`）：
 
 1. 在电脑上找一个**游戏安装目录以外**的空文件夹（如 `D:\MyTEW1Mod\`），打开 **`TEW Mesh` → `1. 导入导出 & 挂载区`**，将其设为 **Mod 外部挂载目录**。
    > ⚠️ 严禁选在游戏本体目录里，所有 Mod 全程零侵入外挂运行。
-2. 点击顶部 **`导入 BMD6`**，选择原版模板（常规游玩主模型为 **`pl0000_ng.bmd6model`**）。
+2. **获取并导入原版模板（3 种方式任选其一，最推荐方式 A）**：
+   - **方式 A（Blender 内 1 秒直提，最简单）**：在 `TEW Mesh > 1` 的「没有 .bmd6model？直接从游戏提取原版模型」框里点放大镜 🔍 **自动检测游戏目录**（或手动选中包含 `EvilWithin.exe` 的目录），直接点 **`一键从游戏提取并导入主模板 (pl0000_ng)`**！无需事先解包，直接把塞巴斯蒂安主模板导进场景！
+   - **方式 B（Blender / Mod 管理器批量导出模型库）**：点 **`批量提取原版 .bmd6model 模型库...`**（或在 `TEW1ModManager.exe` 顶部栏点 **`提取原版模型`**），可选「主角全章节 27 个模板」「全部人物 `pl*`」「全部怪物 `em*`」或「全游戏 2222 个模型」，批量解压成 `.bmd6model` 文件后再用 **`导入 BMD6`** 导入。
+   - **方式 C（独立提取脚本）**：直接双击运行附带的 **`TEW1_TangoResource_Extractor.py`**（GUI + CLI 零依赖）提取任意模型、贴图或音频。
    - 导入后场景中会出现塞巴斯蒂安的原版骨架（名称如 `pl0000_ng`），插件已经把原版骨架模板安全保存在它里面。
 3. 通过你常用的方式（`mmd_tools` / FBX / VRM 导入插件）把你的 **MMD 或 VRChat 角色** 导入同一个场景。
 

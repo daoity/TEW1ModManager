@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "tew1_bmd6"
-version = "2.6.0"
+version = "2.7.0"
 name = "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)"
-tagline = "恶灵附身 1 BMD6 导入导出、MMD/VRChat 一键对骨（防双开门+脚掌1:1+内衣防穿模）、免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情"
+tagline = "内置原版模型一键提取与导入、BMD6 导出、MMD/VRChat 一键对骨（防双开门+脚掌1:1+内衣防穿模）、免转DDS/透纱材质、断肢拆分、TEW Physical 物理与表情"
 maintainer = "TEW1 Mod Tools"
 type = "add-on"
 
