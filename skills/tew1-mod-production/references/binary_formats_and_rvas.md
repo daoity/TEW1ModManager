@@ -2,19 +2,21 @@
 
 ## 1. 目标游戏二进制与内存挂载补丁
 
-- **目标进程**：`EvilWithin.exe` (x64, SHA-256 `8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab`)
+- **目标进程**：`EvilWithin.exe` (x64，支持双构建自动识别)：
+  - **Steam 正版（2015-05-28，Build 2708258）**：SHA-256 `743df7a126a66470dbfc27b8c30348eea7d29bf948b82705da6e7babc6e67437`（`TimeDateStamp=0x5566C3D1`，`SizeOfImage=0x9F3D000`，启动时自动注入环境变量 `SteamAppId=268050` 与 `SteamGameId=268050` 以直连 Steam 客户端并保留挂载参数）
+  - **经典 PC 构建（2015-05-15）**：SHA-256 `8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab`（`TimeDateStamp=0x5555AEBA`，`SizeOfImage=0x9F44000`）
 - **外部挂载启动参数**：
   `+set fs_basepath "<游戏目录>" +set fs_installpath "<外部overlay目录>" +set resource_loadLooseFiles 1`
-- **关键 RVA 表（`src/NativeLoader.cs` & `src/mount.py`）**：
-  - `0x787EF` (`LooseResourceCheckOffset`)：偏移 `+18` 字节由 `0x03` 改为 `0x05`（放行贴图与音频散文件，仅模型时为 `0x04`）。
-  - `0x18F67E` (`ModelOpenCallOffset`)：`.bmd6model` 散文件打开入口。
-  - `0x1BA9DB` (`ImageOpenCallOffset`)：`.bimage` 散文件打开入口。
-  - `0x3141A1` (`WaveOpenCallOffset`)：`.wav` 散文件打开入口。
-  - `0x313F52` (`WaveLangSubCallOffset`)：补丁为 `mov rax, r8; nop; nop`，使 `english/` 下的散装 `.wav` 在中文/日文/英文等任意音频语言设置下都能命中。
-  - `0x305DB2` (`SoundLoadCallOffset`)：跳板优先调用 `idSoundSample::LoadWav` (`0x306040`)；若命中散装 `.wav`，清零 `streamFile` (`[rcx+0x68]=0`) 并置 `loadState=1` (`[rcx+0xC4]=1`)；未命中则回落原 `LoadGeneratedSound` (`0x306D00`)。
-  - `0x318AC0` (`XA2_SoundVoice::Start`)：运行时 DLL 内联跳板 Hook，监听受击/死亡语音播放以自动触发受击与死亡表情。
-  - `0x88C38A0`：`IDXGISwapChain*` 全局指针。
-  - `0x88C38C0`：`ID3D11Device*` 全局指针。
+- **关键 RVA 对照表（`src/NativeLoader.cs`、`src/mount.py` & `runtime_src/tew1_dyn_runtime.cpp` v3.11）**：
+  - `LooseResourceCheckOffset`：Steam 正版 `0x78EEF` / 经典构建 `0x787EF`（偏移 `+18` 字节由 `0x03` 改为 `0x05` 放行贴图与音频散文件，仅模型时为 `0x04`）。
+  - `ModelOpenCallOffset`：Steam 正版 `0x18F69E` / 经典构建 `0x18F67E`（`.bmd6model` 散文件打开入口）。
+  - `ImageOpenCallOffset`：Steam 正版 `0x1BB29B` / 经典构建 `0x1BA9DB`（`.bimage` 散文件打开入口）。
+  - `WaveOpenCallOffset`：Steam 正版 `0x314821` / 经典构建 `0x3141A1`（`.wav` 散文件打开入口）。
+  - `WaveLangSubCallOffset`：Steam 正版 `0x3145D2` (`e8 99 4e d6 ff`) / 经典构建 `0x313F52` (`e8 29 4d d6 ff`)，补丁为 `mov rax, r8; nop; nop`，使 `english/` 下的散装 `.wav` 在任意音频语言设置下命中。
+  - `SoundLoadCallOffset`：Steam 正版 `0x3064F2` (`e8 59 0f 00 00`) / 经典构建 `0x305DB2` (`e8 49 0f 00 00`)；跳板优先调用 `idSoundSample::LoadWav`（Steam `0x306780` / 经典 `0x306040`），未命中则回落 `LoadGeneratedSound`（Steam `0x307450` / 经典 `0x306D00`）。
+  - `XA2_SoundVoice::Start`：Steam 正版 `0x3190F0` / 经典构建 `0x318AC0`（运行时 DLL 内联跳板 Hook，自动触发受击与死亡表情）。
+  - `IDXGISwapChain*` 全局指针：Steam 正版 `0x88BC8A8` / 经典构建 `0x88C38A0`。
+  - `ID3D11Device*` 全局指针：Steam 正版 `0x88BC8C8` / 经典构建 `0x88C38C0`（v3.11 放宽 vtable 所属模块校验，兼容 Steam Overlay `GameOverlayRenderer64.dll` 等代理层）。
 - **散文件覆盖边界**：`.bmd6model`、`.bimage`、`.wav`、新建自定义材质 `.decl` 可直接热挂载覆盖；原版已打包在 `.tangoresource` 内的 UI/声音 `.decl` 不保证被散文件覆盖。
 
 ---
