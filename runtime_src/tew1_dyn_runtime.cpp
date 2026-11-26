@@ -34,9 +34,47 @@
 
 namespace {
 
-constexpr uintptr_t kSwapChainRva     = 0x88c38a0;
-constexpr uintptr_t kDeviceRva        = 0x88c38c0;
-constexpr uintptr_t kXA2VoiceStartRva = 0x318AC0;
+constexpr uintptr_t kDefaultSwapChainRva     = 0x88c38a0;
+constexpr uintptr_t kDefaultDeviceRva        = 0x88c38c0;
+constexpr uintptr_t kDefaultXA2VoiceStartRva = 0x318AC0;
+
+struct ExeBuildOffsets {
+    const char* name = "Unknown";
+    uintptr_t swapChainRva = kDefaultSwapChainRva;
+    uintptr_t deviceRva = kDefaultDeviceRva;
+    uintptr_t xa2VoiceStartRva = kDefaultXA2VoiceStartRva;
+};
+
+ExeBuildOffsets g_exeOffsets{};
+
+static ExeBuildOffsets DetectExeBuildOffsets(uintptr_t imageBase) {
+    ExeBuildOffsets out{};
+    if (!imageBase) return out;
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(imageBase + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE) {
+            const uint32_t ts = nt->FileHeader.TimeDateStamp;
+            const uint32_t imgSz = nt->OptionalHeader.SizeOfImage;
+            if (ts == 0x5566C3D1u || imgSz == 0x9F3D000u) {
+                out.name = "Steam Official x64 (2015-05-28)";
+                out.swapChainRva = 0x88BC8A8;
+                out.deviceRva = 0x88BC8C8;
+                out.xa2VoiceStartRva = 0x3190F0;
+                return out;
+            }
+            if (ts == 0x5555AEBAu || imgSz == 0x9F44000u) {
+                out.name = "Classic x64 (2015-05-15)";
+                out.swapChainRva = 0x88C38A0;
+                out.deviceRva = 0x88C38C0;
+                out.xa2VoiceStartRva = 0x318AC0;
+                return out;
+            }
+        }
+    }
+    return out;
+}
 
 constexpr uint32_t kNumMorphs    = 15;
 constexpr uint32_t kNumColliders = 5;
@@ -1793,16 +1831,31 @@ void __fastcall HookXA2VoiceStart(void* voice, int startSample, int flags, uint8
 }
 
 bool InstallXA2VoiceStartHook(uintptr_t imageBase) {
-    uint8_t* target = reinterpret_cast<uint8_t*>(imageBase + kXA2VoiceStartRva);
+    uintptr_t rva = g_exeOffsets.xa2VoiceStartRva;
+    uint8_t* target = reinterpret_cast<uint8_t*>(imageBase + rva);
     static const uint8_t kExpected[15] = {
         0x48, 0x89, 0x5C, 0x24, 0x18,
         0x48, 0x89, 0x6C, 0x24, 0x20,
         0x57, 0x41, 0x56, 0x41, 0x57
     };
     if (memcmp(target, kExpected, sizeof(kExpected)) != 0) {
-        LogFmt("XA2_SoundVoice::Start signature mismatch at +0x%llX; skipping audio hook.\n",
-               (unsigned long long)kXA2VoiceStartRva);
-        return false;
+        // Fallback: try alternate known RVA before skipping
+        const uintptr_t alts[2] = { 0x3190F0, 0x318AC0 };
+        bool matchedAlt = false;
+        for (uintptr_t alt : alts) {
+            uint8_t* cand = reinterpret_cast<uint8_t*>(imageBase + alt);
+            if (memcmp(cand, kExpected, sizeof(kExpected)) == 0) {
+                rva = alt;
+                target = cand;
+                matchedAlt = true;
+                break;
+            }
+        }
+        if (!matchedAlt) {
+            LogFmt("XA2_SoundVoice::Start signature mismatch at +0x%llX; skipping audio hook.\n",
+                   (unsigned long long)rva);
+            return false;
+        }
     }
 
     uint8_t* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
@@ -3317,7 +3370,7 @@ DWORD WINAPI InitThread(void* param) {
     g_log = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, 0, nullptr);
     char hkName[32] = {};
     GetVkConfigNameA(g_panelToggleVK.load(), hkName, sizeof(hkName));
-    LogFmt("TEW1 Generic Dynamic Runtime v3.10 (Chapter-Safe COM-Pinned VBs + Auto-GC + Double-Sided Sheer + Hotkey=[%s]) starting...\n", hkName);
+    LogFmt("TEW1 Generic Dynamic Runtime v3.11 (Steam Official + Classic Multi-Build + COM-Pinned VBs + Double-Sided Sheer + Hotkey=[%s]) starting...\n", hkName);
 
     wchar_t envVal[32] = {};
     if (GetEnvironmentVariableW(L"TEW1_DYN_HAIR", envVal, 32) > 0 && envVal[0] == L'0') g_enableHair.store(false);
@@ -3347,6 +3400,13 @@ DWORD WINAPI InitThread(void* param) {
     auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"EvilWithin.exe"));
     if (!image) return 2;
 
+    g_exeOffsets = DetectExeBuildOffsets(image);
+    LogFmt("Detected EvilWithin.exe build: %s (DevRVA=0x%llX, SCRVA=0x%llX, XA2RVA=0x%llX)\n",
+           g_exeOffsets.name,
+           (unsigned long long)g_exeOffsets.deviceRva,
+           (unsigned long long)g_exeOffsets.swapChainRva,
+           (unsigned long long)g_exeOffsets.xa2VoiceStartRva);
+
     g_audioHooked = InstallXA2VoiceStartHook(image);
 
     bool d3dHooked = false;
@@ -3354,29 +3414,35 @@ DWORD WINAPI InitThread(void* param) {
         if (!d3dHooked) {
             ID3D11Device* dev = nullptr;
             SIZE_T rd = 0;
-            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(image + kDeviceRva), &dev, sizeof(dev), &rd) && dev) {
-                void** devVt = *reinterpret_cast<void***>(dev);
-                if (devVt && devVt[3]) {
-                    HMODULE owner = nullptr;
-                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           reinterpret_cast<LPCWSTR>(devVt[3]), &owner) &&
-                        owner == GetModuleHandleW(L"d3d11.dll")) {
-                        ID3D11DeviceContext* ctx = nullptr;
-                        dev->GetImmediateContext(&ctx);
-                        if (ctx) {
-                            g_device = dev;
-                            g_immCtx = ctx;
+            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(image + g_exeOffsets.deviceRva), &dev, sizeof(dev), &rd) && dev) {
+                void** devVt = nullptr;
+                if (ReadProcessMemory(GetCurrentProcess(), dev, &devVt, sizeof(devVt), &rd) && devVt) {
+                    void* fnCreateBuf = nullptr;
+                    if (ReadProcessMemory(GetCurrentProcess(), devVt + 3, &fnCreateBuf, sizeof(fnCreateBuf), &rd) && fnCreateBuf) {
+                        HMODULE owner = nullptr;
+                        // Accept d3d11.dll OR overlay/proxy wrappers (e.g. Steam GameOverlayRenderer64.dll, ReShade)
+                        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               reinterpret_cast<LPCWSTR>(fnCreateBuf), &owner) &&
+                            owner != nullptr && owner != reinterpret_cast<HMODULE>(image)) {
+                            ID3D11DeviceContext* ctx = nullptr;
+                            dev->GetImmediateContext(&ctx);
+                            if (ctx) {
+                                char modName[MAX_PATH] = {};
+                                GetModuleFileNameA(owner, modName, MAX_PATH);
+                                g_device = dev;
+                                g_immCtx = ctx;
 
-                            PatchVtableSlot(devVt, 3,  HookCreateBuffer, origCreateBuffer);
-                            PatchVtableSlot(devVt, 15, HookCreatePixelShader, origCreatePS);
-                            PatchVtableSlot(devVt, 27, HookCreateDeferredContext, origCreateDeferredCtx);
+                                PatchVtableSlot(devVt, 3,  HookCreateBuffer, origCreateBuffer);
+                                PatchVtableSlot(devVt, 15, HookCreatePixelShader, origCreatePS);
+                                PatchVtableSlot(devVt, 27, HookCreateDeferredContext, origCreateDeferredCtx);
 
-                            InitEmissiveResources(dev, origCreateBuffer, origCreatePS);
-                            EnsureContextVtableHooked(ctx, "ImmCtxInit");
+                                InitEmissiveResources(dev, origCreateBuffer, origCreatePS);
+                                EnsureContextVtableHooked(ctx, "ImmCtxInit");
 
-                            d3dHooked = true;
-                            LogFmt("D3D11 hooks active (dev=%p, ctx=%p, audioHook=%d, emissivePS=%p)\n",
-                                   dev, ctx, g_audioHooked ? 1 : 0, g_emissivePS);
+                                d3dHooked = true;
+                                LogFmt("D3D11 hooks active (dev=%p, ctx=%p, owner=%s, audioHook=%d, emissivePS=%p)\n",
+                                       dev, ctx, modName, g_audioHooked ? 1 : 0, g_emissivePS);
+                            }
                         }
                     }
                 }
@@ -3385,12 +3451,20 @@ DWORD WINAPI InitThread(void* param) {
         if (d3dHooked && !g_presentHooked) {
             IDXGISwapChain* sc = nullptr;
             SIZE_T rd = 0;
-            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(image + kSwapChainRva), &sc, sizeof(sc), &rd) && sc) {
-                void** scVt = *reinterpret_cast<void***>(sc);
-                if (scVt && scVt[8]) {
+            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(image + g_exeOffsets.swapChainRva), &sc, sizeof(sc), &rd) && sc) {
+                void** scVt = nullptr;
+                void* fnPresent = nullptr;
+                if (ReadProcessMemory(GetCurrentProcess(), sc, &scVt, sizeof(scVt), &rd) && scVt &&
+                    ReadProcessMemory(GetCurrentProcess(), scVt + 8, &fnPresent, sizeof(fnPresent), &rd) && fnPresent) {
+                    HMODULE scOwner = nullptr;
+                    char scModName[MAX_PATH] = {};
+                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCWSTR>(fnPresent), &scOwner) && scOwner) {
+                        GetModuleFileNameA(scOwner, scModName, MAX_PATH);
+                    }
                     PatchVtableSlot(scVt, 8, HookPresent, origPresent);
                     g_presentHooked = true;
-                    LogFmt("IDXGISwapChain::Present hooked (sc=%p). All runtime systems active!\n", sc);
+                    LogFmt("IDXGISwapChain::Present hooked (sc=%p, owner=%s). All runtime systems active!\n", sc, scModName);
                     return 0;
                 }
             }
