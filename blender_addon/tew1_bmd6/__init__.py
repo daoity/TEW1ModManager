@@ -2,10 +2,10 @@
 bl_info = {
     "name": "TEW1 BMD6 & TEW Physical 制作套件 (Blender 4-5)",
     "author": "TEW1 Mod Tools",
-    "version": (2, 8, 0),
+    "version": (2, 9, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (TEW Mesh / TEW Physical) & File > Import / Export",
-    "description": "兼容 Blender 4.0–5.2+：内置原版模型提取、自动回收隐藏废槽(彻底解决pl0000_ng超31槽报错)、MMD/VRChat 一键对骨（防双开门窄肩+脚掌1:1+内衣防穿模）、按贴图去重免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情。",
+    "description": "兼容 Blender 4.0–5.2+：支持 Steam 正版库自动识别与原版模型提取、自动回收隐藏废槽(彻底解决pl0000_ng超31槽报错)、MMD/VRChat 一键对骨（防双开门窄肩+脚掌1:1+内衣防穿模）、按贴图去重免转DDS/透纱材质、断肢拆分、TEW Physical 物理与 TEW Facial 表情。",
     "category": "Import-Export",
 }
 

@@ -3,6 +3,7 @@
 from collections import defaultdict
 import os
 from pathlib import Path
+import re
 from struct import iter_unpack, unpack
 import tempfile
 import zlib
@@ -65,9 +66,41 @@ def is_valid_game_dir(path):
     return (p / "EvilWithin.exe").is_file() and (p / "base" / "common.tangoresource").is_file()
 
 
+def _iter_steam_library_game_dirs():
+    steam_roots = []
+    try:
+        import winreg
+        for hive, subkey, valname in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as k:
+                    val, _ = winreg.QueryValueEx(k, valname)
+                    if val:
+                        steam_roots.append(Path(val))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    out = []
+    for root in steam_roots:
+        out.append(root / "steamapps" / "common" / "TheEvilWithin")
+        vdf = root / "steamapps" / "libraryfolders.vdf"
+        if vdf.is_file():
+            try:
+                txt = vdf.read_text(encoding="utf-8", errors="ignore")
+                for m in re.finditer(r'"path"\s+"([^"]+)"', txt, re.IGNORECASE):
+                    lib = Path(m.group(1).replace("\\\\", "\\"))
+                    out.append(lib / "steamapps" / "common" / "TheEvilWithin")
+            except OSError:
+                pass
+    return out
+
+
 def auto_detect_game_dir():
-    """Search common Steam / GOG / local directories for EvilWithin.exe."""
-    candidates = []
+    """Search Steam registry libraries, common Steam / GOG / local directories for EvilWithin.exe."""
+    candidates = list(_iter_steam_library_game_dirs())
     # Check workspace parent folders near this addon
     here = Path(__file__).resolve()
     for parent in here.parents:

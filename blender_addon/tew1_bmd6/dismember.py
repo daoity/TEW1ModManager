@@ -732,7 +732,7 @@ class TEW1PackModZip(bpy.types.Operator, ExportHelper):
                 f"author={ws.mod_author.strip() or 'TEW1 Modder'}\n"
                 f"version={ws.mod_version.strip() or '1.0'}\n"
                 f"type={'model' if has_model else 'voice'}\n"
-                f"description={ws.mod_desc.strip() or 'Authored with TEW1 BMD6 Blender Plugin v2.8 (TEW Physical)'}\n"
+                f"description={ws.mod_desc.strip() or 'Authored with TEW1 BMD6 Blender Plugin v2.9 (TEW Physical)'}\n"
             )
 
             out_zip = Path(self.filepath)
