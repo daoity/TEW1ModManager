@@ -4,29 +4,51 @@ import argparse
 import ctypes as ct
 from ctypes import wintypes as wt
 import hashlib
+import os
 from pathlib import Path
 import struct
 import subprocess
 import time
 
 
-EXE_SHA256 = '8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab'
-LOOSE_RESOURCE_CHECK = 0x787EF
-STOCK_CHECK = bytes.fromhex('83 3d d2 11 73 02 00 48 8b d9 74 7d 83 3d ae 62 a8 09 03 7d 74')
 PRODUCTION_LIMIT = 18
-ENABLED_CHECK = STOCK_CHECK[:PRODUCTION_LIMIT] + b'\x04' + STOCK_CHECK[PRODUCTION_LIMIT + 1:]
-LOOSE_CVAR = 0x27A99C8
-MODEL_OPEN_CALL = 0x18F67E
-IMAGE_OPEN_CALL = 0x1BA9DB
-WAVE_OPEN_CALL = 0x3141A1
-WAVE_LANG_SUB_CALL = 0x313F52
-SOUND_LOAD_CALL = 0x305DB2
-SOUND_LOAD_WAV = 0x306040
-SOUND_LOAD_GEN = 0x306D00
+STEAM_APP_ID = '268050'
+
+BUILD_PROFILES = {
+    '743df7a126a66470dbfc27b8c30348eea7d29bf948b82705da6e7babc6e67437': {
+        'name': 'Steam Official x64 (Build 2708258)',
+        'is_steam': True,
+        'loose_resource_check': 0x78EEF,
+        'stock_check': bytes.fromhex('83 3d d2 9a 72 02 00 48 8b d9 74 7d 83 3d 2e eb a7 09 03 7d 74'),
+        'model_open_call': 0x18F69E,
+        'image_open_call': 0x1BB29B,
+        'wave_open_call': 0x314821,
+        'wave_lang_sub_call': 0x3145D2,
+        'stock_wave_lang_sub': bytes.fromhex('e8 99 4e d6 ff'),
+        'sound_load_call': 0x3064F2,
+        'stock_sound_load': bytes.fromhex('e8 59 0f 00 00'),
+        'sound_load_wav': 0x306780,
+        'sound_load_gen': 0x307450,
+    },
+    '8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab': {
+        'name': 'Classic x64 (2015-05-15)',
+        'is_steam': False,
+        'loose_resource_check': 0x787EF,
+        'stock_check': bytes.fromhex('83 3d d2 11 73 02 00 48 8b d9 74 7d 83 3d ae 62 a8 09 03 7d 74'),
+        'model_open_call': 0x18F67E,
+        'image_open_call': 0x1BA9DB,
+        'wave_open_call': 0x3141A1,
+        'wave_lang_sub_call': 0x313F52,
+        'stock_wave_lang_sub': bytes.fromhex('e8 29 4d d6 ff'),
+        'sound_load_call': 0x305DB2,
+        'stock_sound_load': bytes.fromhex('e8 49 0f 00 00'),
+        'sound_load_wav': 0x306040,
+        'sound_load_gen': 0x306D00,
+    },
+}
+
 STOCK_MODEL_OPEN = bytes.fromhex('ff 90 48 01 00 00')
-STOCK_WAVE_LANG_SUB = bytes.fromhex('e8 29 4d d6 ff')
 PATCH_WAVE_LANG_BYPASS = bytes.fromhex('4c 89 c0 90 90')
-STOCK_SOUND_LOAD = bytes.fromhex('e8 49 0f 00 00')
 SOUND_LOAD_OVERLAY = bytearray.fromhex(' '.join((
     '48 83 ec 48',
     '48 89 4c 24 30',
@@ -162,19 +184,19 @@ class GameProcess:
                 raise OSError('A resource reader call did not update.')
         return address
 
-    def install_sound_load(self, base, stub_addr):
-        lang_site = base + WAVE_LANG_SUB_CALL
-        if self.read(lang_site, len(STOCK_WAVE_LANG_SUB)) != STOCK_WAVE_LANG_SUB:
+    def install_sound_load(self, base, profile, stub_addr):
+        lang_site = base + profile['wave_lang_sub_call']
+        if self.read(lang_site, len(profile['stock_wave_lang_sub'])) != profile['stock_wave_lang_sub']:
             raise RuntimeError('Wave language path call site did not match the supported build.')
         self.write_code(lang_site, PATCH_WAVE_LANG_BYPASS)
         if self.read(lang_site, len(PATCH_WAVE_LANG_BYPASS)) != PATCH_WAVE_LANG_BYPASS:
             raise OSError('Wave language bypass did not update.')
-        site = base + SOUND_LOAD_CALL
-        if self.read(site, len(STOCK_SOUND_LOAD)) != STOCK_SOUND_LOAD:
+        site = base + profile['sound_load_call']
+        if self.read(site, len(profile['stock_sound_load'])) != profile['stock_sound_load']:
             raise RuntimeError('Sound loader call site did not match the supported build.')
         stub = bytearray(SOUND_LOAD_OVERLAY)
-        struct.pack_into('<i', stub, 0x22, (base + SOUND_LOAD_WAV) - (stub_addr + 0x26))
-        struct.pack_into('<i', stub, 0x53, (base + SOUND_LOAD_GEN) - (stub_addr + 0x57))
+        struct.pack_into('<i', stub, 0x22, (base + profile['sound_load_wav']) - (stub_addr + 0x26))
+        struct.pack_into('<i', stub, 0x53, (base + profile['sound_load_gen']) - (stub_addr + 0x57))
         self.write_code(stub_addr, bytes(stub))
         patch = b'\xe8' + struct.pack('<i', stub_addr - site - 5)
         self.write_code(site, patch)
@@ -182,25 +204,27 @@ class GameProcess:
             raise OSError('Sound loader call did not update.')
 
 
-def enable_overlay(child, has_textures=False, has_sounds=False, timeout=20):
+def enable_overlay(child, profile, has_textures=False, has_sounds=False, timeout=20):
     deadline = time.monotonic() + timeout
+    stock_check = profile['stock_check']
+    check_rva = profile['loose_resource_check']
     with GameProcess(child.pid) as process:
         while time.monotonic() < deadline and child.poll() is None:
             base = process.image_base()
-            if base and process.read(base + LOOSE_RESOURCE_CHECK, len(STOCK_CHECK)) == STOCK_CHECK:
-                sites = [MODEL_OPEN_CALL]
+            if base and process.read(base + check_rva, len(stock_check)) == stock_check:
+                sites = [profile['model_open_call']]
                 if has_textures:
-                    sites.append(IMAGE_OPEN_CALL)
+                    sites.append(profile['image_open_call'])
                 if has_sounds:
-                    sites.append(WAVE_OPEN_CALL)
+                    sites.append(profile['wave_open_call'])
                 allocated = process.install_resource_open(base, sites)
                 if has_sounds:
-                    process.install_sound_load(base, allocated + 0x100)
+                    process.install_sound_load(base, profile, allocated + 0x100)
                 # Declarations may first be resolved while the map is in production-in-game mode.
                 limit = b'\x05' if (has_textures or has_sounds) else b'\x04'
-                expected = ENABLED_CHECK[:PRODUCTION_LIMIT] + limit + ENABLED_CHECK[PRODUCTION_LIMIT + 1:]
-                process.write_code_byte(base + LOOSE_RESOURCE_CHECK + PRODUCTION_LIMIT, limit)
-                if process.read(base + LOOSE_RESOURCE_CHECK, len(STOCK_CHECK)) != expected:
+                expected = stock_check[:PRODUCTION_LIMIT] + limit + stock_check[PRODUCTION_LIMIT + 1:]
+                process.write_code_byte(base + check_rva + PRODUCTION_LIMIT, limit)
+                if process.read(base + check_rva, len(stock_check)) != expected:
                     raise OSError('The game did not retain the expected in-memory resource check.')
                 return base
             time.sleep(0.025)
@@ -225,7 +249,8 @@ def launch(game, overlay, save_root=None, cache_root=None, extra=(), exe_dir=Non
     exe = ((exe_dir or game) / 'EvilWithin.exe').resolve(strict=True)
     with exe.open('rb') as file:
         build = hashlib.file_digest(file, 'sha256').hexdigest()
-    if build != EXE_SHA256:
+    profile = BUILD_PROFILES.get(build.lower())
+    if profile is None:
         raise ValueError(f'Unsupported EvilWithin.exe SHA-256: {build}')
     command = [str(exe), '+set', 'fs_basepath', str(game), '+set', 'fs_installpath', str(overlay)]
     for name, path in (('fs_savepath', save_root), ('fs_cachepath', cache_root)):
@@ -235,11 +260,16 @@ def launch(game, overlay, save_root=None, cache_root=None, extra=(), exe_dir=Non
             command.extend(('+set', name, str(path)))
     command.extend(extra)
     command.extend(('+set', 'resource_loadLooseFiles', '1'))
+    env = os.environ.copy()
+    if profile['is_steam']:
+        env['SteamAppId'] = STEAM_APP_ID
+        env['SteamGameId'] = STEAM_APP_ID
     streams = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if quiet_game else {}
-    child = subprocess.Popen(command, cwd=exe.parent, startupinfo=startupinfo, **streams)
+    child = subprocess.Popen(command, cwd=exe.parent, env=env, startupinfo=startupinfo, **streams)
     try:
         base = enable_overlay(
             child,
+            profile,
             (overlay / 'base' / 'generated' / 'textures').is_dir(),
             (overlay / 'base' / 'sound').is_dir(),
         )

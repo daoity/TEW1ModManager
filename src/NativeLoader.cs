@@ -32,48 +32,106 @@ namespace TEW1
     /// </summary>
     internal static class NativeLoader
     {
-        internal const string SupportedExeSha256 = "8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab";
+        internal sealed class BuildProfile
+        {
+            public string Name;
+            public string Sha256;
+            public bool IsSteamBuild;
+            public long LooseResourceCheckOffset;
+            public byte[] StockCheck;
+            public long ModelOpenCallOffset;
+            public long ImageOpenCallOffset;
+            public long WaveOpenCallOffset;
+            public long WaveLangSubCallOffset;
+            public byte[] StockWaveLangSubCall;
+            public long SoundLoadCallOffset;
+            public byte[] StockSoundLoadCall;
+            public long SoundLoadWavOffset;
+            public long SoundLoadGeneratedOffset;
+        }
 
-        private const long LooseResourceCheckOffset = 0x787EF;
         private const int ProductionLimitIndex = 18;
-        private const long ModelOpenCallOffset = 0x18F67E;
-        private const long ImageOpenCallOffset = 0x1BA9DB;
-        private const long WaveOpenCallOffset = 0x3141A1;
-        private const long WaveLangSubCallOffset = 0x313F52;
-        private const long SoundLoadCallOffset = 0x305DB2;
-        private const long SoundLoadWavOffset = 0x306040;
-        private const long SoundLoadGeneratedOffset = 0x306D00;
+        private const string SteamAppId = "268050";
+
+        private static readonly BuildProfile[] SupportedBuilds = new[]
+        {
+            new BuildProfile
+            {
+                Name = "Steam 正版 (x64 · Build 2708258)",
+                Sha256 = "743df7a126a66470dbfc27b8c30348eea7d29bf948b82705da6e7babc6e67437",
+                IsSteamBuild = true,
+                LooseResourceCheckOffset = 0x78EEF,
+                StockCheck = new byte[]
+                {
+                    0x83, 0x3d, 0xd2, 0x9a, 0x72, 0x02, 0x00,
+                    0x48, 0x8b, 0xd9, 0x74, 0x7d,
+                    0x83, 0x3d, 0x2e, 0xeb, 0xa7, 0x09, 0x03,
+                    0x7d, 0x74
+                },
+                ModelOpenCallOffset = 0x18F69E,
+                ImageOpenCallOffset = 0x1BB29B,
+                WaveOpenCallOffset = 0x314821,
+                WaveLangSubCallOffset = 0x3145D2,
+                StockWaveLangSubCall = new byte[] { 0xe8, 0x99, 0x4e, 0xd6, 0xff },
+                SoundLoadCallOffset = 0x3064F2,
+                StockSoundLoadCall = new byte[] { 0xe8, 0x59, 0x0f, 0x00, 0x00 },
+                SoundLoadWavOffset = 0x306780,
+                SoundLoadGeneratedOffset = 0x307450
+            },
+            new BuildProfile
+            {
+                Name = "经典构建 (x64 · 2015-05-15)",
+                Sha256 = "8737abc65d2b575cb6acb8c435dd7e2ce1053411a084b87f24e493b68df2c0ab",
+                IsSteamBuild = false,
+                LooseResourceCheckOffset = 0x787EF,
+                StockCheck = new byte[]
+                {
+                    0x83, 0x3d, 0xd2, 0x11, 0x73, 0x02, 0x00,
+                    0x48, 0x8b, 0xd9, 0x74, 0x7d,
+                    0x83, 0x3d, 0xae, 0x62, 0xa8, 0x09, 0x03,
+                    0x7d, 0x74
+                },
+                ModelOpenCallOffset = 0x18F67E,
+                ImageOpenCallOffset = 0x1BA9DB,
+                WaveOpenCallOffset = 0x3141A1,
+                WaveLangSubCallOffset = 0x313F52,
+                StockWaveLangSubCall = new byte[] { 0xe8, 0x29, 0x4d, 0xd6, 0xff },
+                SoundLoadCallOffset = 0x305DB2,
+                StockSoundLoadCall = new byte[] { 0xe8, 0x49, 0x0f, 0x00, 0x00 },
+                SoundLoadWavOffset = 0x306040,
+                SoundLoadGeneratedOffset = 0x306D00
+            }
+        };
+
+        internal static BuildProfile FindBuildProfile(string sha256)
+        {
+            if (String.IsNullOrWhiteSpace(sha256)) return null;
+            for (int i = 0; i < SupportedBuilds.Length; i++)
+            {
+                if (String.Equals(SupportedBuilds[i].Sha256, sha256, StringComparison.OrdinalIgnoreCase))
+                    return SupportedBuilds[i];
+            }
+            return null;
+        }
+
+        private static bool IsSteamClientRunning()
+        {
+            try { return Process.GetProcessesByName("steam").Length > 0; }
+            catch { return true; }
+        }
 
         private const uint ProcessAccess = 0x0438; // QUERY_INFO | VM_OPERATION | VM_READ | VM_WRITE
         private const uint MemCommitReserve = 0x3000;
         private const uint PageExecuteRead = 0x20;
         private const uint PageExecuteReadWrite = 0x40;
 
-        private static readonly byte[] StockCheck = new byte[]
-        {
-            0x83, 0x3d, 0xd2, 0x11, 0x73, 0x02, 0x00,
-            0x48, 0x8b, 0xd9, 0x74, 0x7d,
-            0x83, 0x3d, 0xae, 0x62, 0xa8, 0x09, 0x03,
-            0x7d, 0x74
-        };
-
         private static readonly byte[] StockModelOpen = new byte[]
         {
             0xff, 0x90, 0x48, 0x01, 0x00, 0x00
         };
 
-        private static readonly byte[] StockSoundLoadCall = new byte[]
-        {
-            0xe8, 0x49, 0x0f, 0x00, 0x00
-        };
-
         // In idWaveFile::Open, bypass language-segment rewrite ("english" -> currentLang)
         // so loose WAV mods placed under base/sound/voice_talk/english/... work in ALL game audio languages!
-        private static readonly byte[] StockWaveLangSubCall = new byte[]
-        {
-            0xe8, 0x29, 0x4d, 0xd6, 0xff
-        };
-
         private static readonly byte[] PatchWaveLangBypass = new byte[]
         {
             0x4c, 0x89, 0xc0, 0x90, 0x90  // mov rax, r8; nop; nop
@@ -333,14 +391,15 @@ namespace TEW1
             try
             {
                 string sha = ComputeSha256(exePath);
-                if (!String.Equals(sha, SupportedExeSha256, StringComparison.OrdinalIgnoreCase))
+                BuildProfile profile = FindBuildProfile(sha);
+                if (profile == null)
                 {
                     return new GameValidationResult
                     {
                         State = GameCheckState.UnsupportedBuild,
                         NormalizedPath = root,
                         Sha256 = sha,
-                        Message = "EvilWithin.exe 版本不匹配（SHA-256 校验未通过）"
+                        Message = "EvilWithin.exe 版本不匹配（未命中支持的 Steam 正版或经典构建 SHA-256）"
                     };
                 }
 
@@ -349,7 +408,7 @@ namespace TEW1
                     State = GameCheckState.Ready,
                     NormalizedPath = root,
                     Sha256 = sha,
-                    Message = "已校验 · 支持的 Windows x64 构建"
+                    Message = "已校验 · " + profile.Name
                 };
             }
             catch (Exception ex)
@@ -388,6 +447,10 @@ namespace TEW1
                 throw new InvalidOperationException("游戏窗口已经打开。请先关闭游戏，再重新启动。");
 
             string exePath = Path.Combine(game, "EvilWithin.exe");
+            BuildProfile profile = null;
+            try { profile = FindBuildProfile(ComputeSha256(exePath)); }
+            catch { }
+
             var info = new ProcessStartInfo
             {
                 FileName = exePath,
@@ -395,6 +458,11 @@ namespace TEW1
                 WorkingDirectory = game,
                 UseShellExecute = false
             };
+            if (profile != null && profile.IsSteamBuild)
+            {
+                info.EnvironmentVariables["SteamAppId"] = SteamAppId;
+                info.EnvironmentVariables["SteamGameId"] = SteamAppId;
+            }
             Process child = Process.Start(info);
             if (child == null)
                 throw new InvalidOperationException("无法启动 EvilWithin.exe。");
@@ -425,11 +493,13 @@ namespace TEW1
 
             string exePath = Path.Combine(game, "EvilWithin.exe");
             string actualSha = ComputeSha256(exePath);
-            if (!String.Equals(actualSha, SupportedExeSha256, StringComparison.OrdinalIgnoreCase))
+            BuildProfile profile = FindBuildProfile(actualSha);
+            if (profile == null)
             {
+                string expectedList = String.Join("\n", SupportedBuilds.Select(b => "  · " + b.Name + "：" + b.Sha256));
                 throw new InvalidOperationException(
                     "当前 EvilWithin.exe 版本与此加载器不匹配。\n" +
-                    "期望 SHA-256：" + SupportedExeSha256 + "\n" +
+                    "支持的构建 SHA-256：\n" + expectedList + "\n" +
                     "当前 SHA-256：" + actualSha);
             }
 
@@ -472,6 +542,12 @@ namespace TEW1
                         WorkingDirectory = game,
                         UseShellExecute = false
                     };
+                    if (profile.IsSteamBuild)
+                    {
+                        // Keep Steamworks initialized directly inside this process without SteamAPI_RestartAppIfNecessary dropping overlay args
+                        startInfo.EnvironmentVariables["SteamAppId"] = SteamAppId;
+                        startInfo.EnvironmentVariables["SteamGameId"] = SteamAppId;
+                    }
 
                     // Generic Mod-side dynamic physics & facial morph extension (activated only if Mod contains base/generated/tew1_dyn.bin)
                     string runtimePack = FindRuntimePack(overlay);
@@ -493,7 +569,7 @@ namespace TEW1
                     bool hasSounds = Directory.Exists(Path.Combine(overlay, "base", "sound"));
                     try
                     {
-                        EnableOverlay(child, hasTextures, hasSounds, timeoutMs);
+                        EnableOverlay(child, profile, hasTextures, hasSounds, timeoutMs);
                     }
                     catch
                     {
@@ -515,8 +591,8 @@ namespace TEW1
                         runtimeLoaded = InjectDll(child.Id, runtimeDll);
                     }
 
-                    return String.Format("Loose resources enabled for EvilWithin.exe (PID {0}, textures={1}, sounds={2}, runtime={3}).",
-                        child.Id, hasTextures ? "on" : "off", hasSounds ? "on" : "off", runtimeLoaded ? "on" : "off");
+                    return String.Format("Loose resources enabled for {0} (PID {1}, textures={2}, sounds={3}, runtime={4}).",
+                        profile.Name, child.Id, hasTextures ? "on" : "off", hasSounds ? "on" : "off", runtimeLoaded ? "on" : "off");
                 }
                 finally
                 {
@@ -525,7 +601,7 @@ namespace TEW1
             }
         }
 
-        private static void EnableOverlay(Process child, bool hasTextures, bool hasSounds, int timeoutMs)
+        private static void EnableOverlay(Process child, BuildProfile profile, bool hasTextures, bool hasSounds, int timeoutMs)
         {
             var stopwatch = Stopwatch.StartNew();
             using (var proc = new GameProcessHandle(child.Id))
@@ -535,26 +611,26 @@ namespace TEW1
                     long imageBase = proc.GetImageBase();
                     if (imageBase != 0)
                     {
-                        byte[] current = proc.Read(imageBase + LooseResourceCheckOffset, StockCheck.Length);
-                        if (BytesEqual(current, StockCheck))
+                        byte[] current = proc.Read(imageBase + profile.LooseResourceCheckOffset, profile.StockCheck.Length);
+                        if (BytesEqual(current, profile.StockCheck))
                         {
-                            var siteList = new List<long> { ModelOpenCallOffset };
-                            if (hasTextures) siteList.Add(ImageOpenCallOffset);
-                            if (hasSounds) siteList.Add(WaveOpenCallOffset);
+                            var siteList = new List<long> { profile.ModelOpenCallOffset };
+                            if (hasTextures) siteList.Add(profile.ImageOpenCallOffset);
+                            if (hasSounds) siteList.Add(profile.WaveOpenCallOffset);
 
                             long allocated = proc.InstallResourceOpen(imageBase, siteList.ToArray());
                             if (hasSounds)
                             {
-                                proc.InstallSoundLoadHook(imageBase, allocated + 0x100);
+                                proc.InstallSoundLoadHook(imageBase, profile, allocated + 0x100);
                             }
 
                             byte limit = (hasTextures || hasSounds) ? (byte)0x05 : (byte)0x04;
-                            byte[] expected = (byte[])StockCheck.Clone();
+                            byte[] expected = (byte[])profile.StockCheck.Clone();
                             expected[ProductionLimitIndex] = limit;
 
-                            proc.WriteCode(imageBase + LooseResourceCheckOffset + ProductionLimitIndex, new byte[] { limit });
+                            proc.WriteCode(imageBase + profile.LooseResourceCheckOffset + ProductionLimitIndex, new byte[] { limit });
 
-                            byte[] verify = proc.Read(imageBase + LooseResourceCheckOffset, StockCheck.Length);
+                            byte[] verify = proc.Read(imageBase + profile.LooseResourceCheckOffset, profile.StockCheck.Length);
                             if (!BytesEqual(verify, expected))
                                 throw new IOException("游戏内存中的资源检查位未保持预期修改。");
 
@@ -566,7 +642,10 @@ namespace TEW1
             }
 
             string exitInfo = child.HasExited ? child.ExitCode.ToString() : "仍在运行";
-            throw new InvalidOperationException("未能在超时时间内定位到受支持的游戏资源读取入口（进程状态：" + exitInfo + "）。");
+            string steamHint = (profile.IsSteamBuild && !IsSteamClientRunning())
+                ? "\n\n检测到 Steam 客户端未运行：正版《恶灵附身》请先打开并登录 Steam 客户端后再点击启动。"
+                : "";
+            throw new InvalidOperationException("未能在超时时间内定位到受支持的游戏资源读取入口（进程状态：" + exitInfo + "）。" + steamHint);
         }
 
         private static bool BytesEqual(byte[] a, byte[] b)
@@ -677,24 +756,24 @@ namespace TEW1
                 return allocated;
             }
 
-            public void InstallSoundLoadHook(long imageBase, long stubAddress)
+            public void InstallSoundLoadHook(long imageBase, BuildProfile profile, long stubAddress)
             {
-                long langSite = imageBase + WaveLangSubCallOffset;
-                byte[] langActual = Read(langSite, StockWaveLangSubCall.Length);
-                if (!BytesEqual(langActual, StockWaveLangSubCall))
+                long langSite = imageBase + profile.WaveLangSubCallOffset;
+                byte[] langActual = Read(langSite, profile.StockWaveLangSubCall.Length);
+                if (!BytesEqual(langActual, profile.StockWaveLangSubCall))
                     throw new InvalidOperationException("音频语言路径调用点特征码与受支持的构建不匹配。");
                 WriteCode(langSite, PatchWaveLangBypass);
                 if (!BytesEqual(Read(langSite, PatchWaveLangBypass.Length), PatchWaveLangBypass))
                     throw new IOException("音频语言路径补丁校验失败。");
 
-                long callSite = imageBase + SoundLoadCallOffset;
-                byte[] actual = Read(callSite, StockSoundLoadCall.Length);
-                if (!BytesEqual(actual, StockSoundLoadCall))
+                long callSite = imageBase + profile.SoundLoadCallOffset;
+                byte[] actual = Read(callSite, profile.StockSoundLoadCall.Length);
+                if (!BytesEqual(actual, profile.StockSoundLoadCall))
                     throw new InvalidOperationException("音频加载调用点特征码与受支持的构建不匹配。");
 
                 byte[] stub = (byte[])SoundLoadOverlayTemplate.Clone();
-                int relLoadWav = checked((int)((imageBase + SoundLoadWavOffset) - (stubAddress + 0x26)));
-                int relLoadGen = checked((int)((imageBase + SoundLoadGeneratedOffset) - (stubAddress + 0x57)));
+                int relLoadWav = checked((int)((imageBase + profile.SoundLoadWavOffset) - (stubAddress + 0x26)));
+                int relLoadGen = checked((int)((imageBase + profile.SoundLoadGeneratedOffset) - (stubAddress + 0x57)));
                 Buffer.BlockCopy(BitConverter.GetBytes(relLoadWav), 0, stub, 0x22, 4);
                 Buffer.BlockCopy(BitConverter.GetBytes(relLoadGen), 0, stub, 0x53, 4);
 

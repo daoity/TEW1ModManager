@@ -1,3 +1,4 @@
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -6,6 +7,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace TEW1
@@ -718,9 +720,55 @@ namespace TEW1
             return root;
         }
 
+        private static IEnumerable<string> GetSteamLibraryGameDirs()
+        {
+            var steamRoots = new List<string>();
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam"))
+                {
+                    string p = key != null ? key.GetValue("SteamPath") as string : null;
+                    if (!String.IsNullOrWhiteSpace(p)) steamRoots.Add(p.Replace('/', '\\'));
+                }
+            }
+            catch { }
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Valve\Steam"))
+                {
+                    string p = key != null ? key.GetValue("InstallPath") as string : null;
+                    if (!String.IsNullOrWhiteSpace(p)) steamRoots.Add(p.Replace('/', '\\'));
+                }
+            }
+            catch { }
+
+            var results = new List<string>();
+            foreach (string steamRoot in steamRoots.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                results.Add(Path.Combine(steamRoot, "steamapps", "common", "TheEvilWithin"));
+                string vdf = Path.Combine(steamRoot, "steamapps", "libraryfolders.vdf");
+                if (!File.Exists(vdf)) continue;
+                try
+                {
+                    string text = File.ReadAllText(vdf, Encoding.UTF8);
+                    foreach (Match m in Regex.Matches(text, "\"path\"\\s+\"([^\"]+)\"", RegexOptions.IgnoreCase))
+                    {
+                        string libPath = m.Groups[1].Value.Replace("\\\\", "\\").Replace('/', '\\');
+                        if (!String.IsNullOrWhiteSpace(libPath))
+                            results.Add(Path.Combine(libPath, "steamapps", "common", "TheEvilWithin"));
+                    }
+                }
+                catch { }
+            }
+            return results;
+        }
+
         internal static string AutoDetectGameDirectory()
         {
             var candidates = new List<string>();
+            // Prefer Steam official library installations discovered via Steam registry & libraryfolders.vdf
+            candidates.AddRange(GetSteamLibraryGameDirs());
+
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             candidates.Add(baseDir);
 
@@ -738,11 +786,12 @@ namespace TEW1
             }
             catch { }
 
-            string[] drives = new[] { "C", "D", "E", "F", "G" };
+            string[] drives = new[] { "C", "D", "E", "F", "G", "H" };
             foreach (string drive in drives)
             {
                 candidates.Add(drive + @":\Program Files (x86)\Steam\steamapps\common\TheEvilWithin");
                 candidates.Add(drive + @":\SteamLibrary\steamapps\common\TheEvilWithin");
+                candidates.Add(drive + @":\Steam\steamapps\common\TheEvilWithin");
                 candidates.Add(drive + @":\Games\TheEvilWithin");
                 candidates.Add(drive + @":\TheEvilWithin");
             }
